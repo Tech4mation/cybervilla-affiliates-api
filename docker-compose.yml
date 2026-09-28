@@ -1,0 +1,31 @@
+# The local database, so nobody has to install PostgreSQL to work on this.
+#
+# Port 5434 rather than the usual 5432: this machine already has other
+# PostgreSQL containers on 5432 and 5433, and a clash there is a confusing
+# failure — you connect successfully, to the wrong database.
+#
+# The password here is deliberately boring. It is a container on your own
+# machine holding a copy of a public product catalogue. Production credentials
+# come from the environment and never from this file.
+
+services:
+  db:
+    image: postgres:16
+    container_name: cybervilla-affiliates-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: affiliates
+      POSTGRES_PASSWORD: affiliates
+      POSTGRES_DB: affiliates
+    ports:
+      - "5434:5432"
+    volumes:
+      - affiliates-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U affiliates -d affiliates"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  affiliates-db:
