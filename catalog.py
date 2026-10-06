@@ -14,10 +14,11 @@ where it was and is served with the time it was taken, so the dashboard can say
 import base64
 import logging
 
-from sqlalchemy import func, or_
+from sqlalchemy import case, func, or_
 
 from config import Config
-from models import CatalogueSync, Product, ProductImage, db, utcnow
+from notification_service import notify_affiliate
+from models import AffiliateLink, CatalogueSync, Product, ProductImage, db, utcnow
 from odoo_client import OdooClient, currency_code, many2one
 
 log = logging.getLogger(__name__)
@@ -77,12 +78,34 @@ def refresh_catalogue(batch_size: int = 200, with_images: bool = True) -> dict:
         # product marked unavailable.
         withdrawn = 0
         if seen:
+            # Whose links point at something about to disappear. Collected
+            # before the update, because afterwards there is no way to tell
+            # which products went in this sync rather than an earlier one.
+            going = (
+                db.session.query(AffiliateLink.affiliate_id, AffiliateLink.code, Product.name)
+                .join(Product, Product.odoo_id == AffiliateLink.product_odoo_id)
+                .filter(AffiliateLink.active.is_(True),
+                        Product.available.is_(True),
+                        Product.odoo_id.notin_(seen))
+                .all()
+            )
             withdrawn = (
                 Product.query
                 .filter(Product.available.is_(True), Product.odoo_id.notin_(seen))
                 .update({"available": False, "synced_at": utcnow()},
                         synchronize_session=False)
             )
+            db.session.commit()
+            # A link to a product that has left the website takes customers to
+            # an error page, so the affiliate needs to know to stop sharing it.
+            for affiliate_id, code, product_name in going:
+                notify_affiliate(
+                    affiliate_id, "link.broken",
+                    f"Your link to {product_name[:60]} has stopped working",
+                    f"{product_name[:120]} is no longer on the CyberVilla website, so the link "
+                    f"{code} now leads nowhere. Delete it and make a new one for something else.",
+                    "/links",
+                )
 
         # Pictures, while we already hold an authenticated connection. Doing it
         # here rather than when a card is first shown is what keeps the store
@@ -180,10 +203,15 @@ def catalogue_state() -> dict:
 def query_products(search: str = "", category_id: int | None = None,
                    page: int = 1, per_page: int = 24,
                    include_unavailable: bool = False):
-    """A page of products, newest-first by nothing in particular — name order.
+    """A page of products: campaign products first, then by name.
 
-    Name order because this list is browsed by a person looking for a product
-    they have in mind, not scanned for what changed.
+    Name order because this list is browsed by a person looking for a
+    product they have in mind, not scanned for what changed.
+
+    Products in a live campaign are floated to the front. This is done in the
+    query, not in the browser, because the list is paged: sorting the page
+    the browser happens to hold would leave a campaign product on page 7
+    sitting on page 7, which is the whole problem it is meant to solve.
     """
     query = Product.query
     if not include_unavailable:
@@ -202,8 +230,16 @@ def query_products(search: str = "", category_id: int | None = None,
     total = query.order_by(None).count()
     page = max(1, int(page))
     per_page = max(1, min(int(per_page), 100))
+
+    from campaign_service import campaign_product_ids
+
+    order = [Product.name.asc(), Product.odoo_id.asc()]
+    promoted = campaign_product_ids()
+    if promoted:
+        order.insert(0, case((Product.odoo_id.in_(promoted), 0), else_=1))
+
     rows = (
-        query.order_by(Product.name.asc(), Product.odoo_id.asc())
+        query.order_by(*order)
         .limit(per_page)
         .offset((page - 1) * per_page)
         .all()

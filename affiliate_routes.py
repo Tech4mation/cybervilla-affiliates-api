@@ -61,10 +61,12 @@ def create_link_route(backend_ref: str):
         return jsonify({"error": "not_found", "message": "No such affiliate."}), 404
 
     body = request.get_json(silent=True) or {}
+    product_id = body.get("productId")
     link = create_link(
         affiliate=affiliate,
         markup_percent=body.get("markupPercent", 0),
         label=body.get("label", ""),
+        product_odoo_id=int(product_id) if product_id else None,
     )
     # 201 whether or not the store push landed; `synced` says which. A link the
     # store has not accepted yet will not price there until resync succeeds.

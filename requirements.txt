@@ -11,4 +11,7 @@ python-dotenv==1.0.1
 psycopg[binary]>=3.2.3
 PyJWT>=2.8.0
 gunicorn==23.0.0
+# Paystack is the only thing this service talks to over plain HTTP; Odoo is
+# reached over XML-RPC in the standard library.
+requests==2.32.5
 

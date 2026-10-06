@@ -180,7 +180,14 @@ class OdooClient:
     # ------------------------------------------------------------------ #
 
     def iter_products(self, batch_size: int = 200):
-        """Every saleable, active product, a batch at a time.
+        """Every product an affiliate can actually send a customer to.
+
+        `is_published` is the important one: it means the product is on the
+        website. Without it we mirrored everything saleable — about 5,200
+        products — while only ~665 were on the storefront, so an affiliate
+        could promote something a customer had no way to buy. A storewide link
+        failed silently (the item simply never appears in the shop) and a
+        product link failed loudly (the page answers 403).
 
         Ordered by id so that the boundary between one batch and the next is
         stable. Ordering by name would let a product renamed mid-sync move
@@ -189,7 +196,11 @@ class OdooClient:
         A generator rather than a list because the catalogue is read in full on
         every sync and there is no reason to hold all of it in memory at once.
         """
-        domain: list = [["sale_ok", "=", True], ["active", "=", True]]
+        domain: list = [
+            ["sale_ok", "=", True],
+            ["active", "=", True],
+            ["is_published", "=", True],
+        ]
         offset = 0
         batch_size = max(1, min(int(batch_size), 500))
         while True:
@@ -250,6 +261,22 @@ class OdooClient:
         return int(self._call(
             "cybervilla.affiliate", "upsert_from_backend", [vals]
         ))
+
+    def template_id_for(self, product_id: int) -> int | None:
+        """The product.template a product.product belongs to.
+
+        Our catalogue mirrors product.product (variants) and stores those ids,
+        but a link lands on a product.template. The two are separate tables
+        with separate id sequences, so passing one where the other is expected
+        silently points at an unrelated product rather than failing.
+        """
+        rows = self._call("product.product", "read", [[int(product_id)]],
+                          {"fields": ["product_tmpl_id"]})
+        if not rows:
+            return None
+        found = rows[0].get("product_tmpl_id")
+        # Odoo returns a many2one as [id, display_name].
+        return int(found[0]) if found else None
 
     def upsert_affiliate_link(self, vals: dict) -> dict:
         """Create or update a link and its markup pricelist.

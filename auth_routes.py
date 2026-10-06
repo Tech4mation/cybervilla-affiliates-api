@@ -8,10 +8,14 @@ Provides:
 """
 
 import logging
+from datetime import datetime, timezone
+
 from flask import Blueprint, g, jsonify, make_response, render_template_string, request
 from sqlalchemy import func
 
-from affiliate_service import create_link, earnings_by_link
+from affiliate_service import LinkLimitReached, create_link, delete_link, earnings_by_link
+from catalog import StoreNotConfigured
+from config import Config
 from auth_service import (
     approve_affiliate,
     get_current_user,
@@ -22,7 +26,31 @@ from auth_service import (
     signin_user,
     signup_affiliate,
 )
-from models import Affiliate, AffiliateLink, Earning, User, db
+from models import (
+    Affiliate, AffiliateLink, Campaign, CampaignProduct, Earning, Notification,
+    Payout, User, amount_due, db, utcnow,
+)
+from campaign_service import announce_live_campaigns, live_campaigns, rewards_by_product
+from notification_service import unread_count
+from paystack_client import (
+    PaystackError,
+    PaystackNotConfigured,
+    list_banks,
+    resolve_account,
+)
+from payout_service import (
+    PayoutError,
+    approvable_earnings,
+    approve_earnings,
+    confirm_payout_otp,
+    fail_payout,
+    mark_paid,
+    payable_balance,
+    reconcile_payout,
+    request_payout,
+    resend_payout_otp,
+    send_payout,
+)
 
 log = logging.getLogger(__name__)
 
@@ -47,9 +75,6 @@ def signup_route():
             email=body.get("email", ""),
             password=body.get("password", ""),
             phone=body.get("phone", ""),
-            promotional_channel=body.get("promotionalChannel") or body.get("promotional_channel") or body.get("channel", ""),
-            channel_url=body.get("channelUrl") or body.get("channel_url") or body.get("link", ""),
-            audience_size=body.get("audienceSize") or body.get("audience_size", ""),
             why_join=body.get("whyJoin") or body.get("why_join") or body.get("pitch", ""),
         )
     except ValueError as exc:
@@ -135,13 +160,33 @@ def affiliate_profile_route():
     }), 200
 
 
+@auth_bp.route("/affiliate/rules", methods=["GET"])
+@require_approved_affiliate
+def affiliate_rules_route():
+    """The numbers the affiliate-facing copy quotes back at people.
+
+    Every one of them is configurable, and all of them are enforced
+    elsewhere in this service. A help page that states a different cap from
+    the one actually applied is worse than one that states nothing, so the
+    rules travel to the dashboard rather than being written into it twice.
+    """
+    return jsonify({
+        "maxMarkupPercent": float(Config.MAX_MARKUP_PERCENT),
+        "maxLinks": int(Config.MAX_LINKS_PER_AFFILIATE),
+        "minPayout": float(Config.MIN_PAYOUT_AMOUNT),
+        "holdDays": int(Config.EARNING_HOLD_DAYS),
+    }), 200
+
+
 @auth_bp.route("/affiliate/links", methods=["GET"])
 @require_approved_affiliate
 def list_affiliate_links_route():
     user: User = g.current_user
     if not user.affiliate:
         return jsonify({"links": []}), 200
-    links = AffiliateLink.query.filter_by(affiliate_id=user.affiliate.id).order_by(AffiliateLink.id.desc()).all()
+    links = (AffiliateLink.query
+             .filter_by(affiliate_id=user.affiliate.id, active=True)
+             .order_by(AffiliateLink.id.desc()).all())
     # Earnings are looked up for this affiliate only, so one affiliate's links
     # can never carry another's figures.
     stats = earnings_by_link(user.affiliate.id)
@@ -150,7 +195,12 @@ def list_affiliate_links_route():
         row = link.as_dict()
         row.update(stats.get(link.id) or {"sales": 0, "earnings": 0.0, "currency": None})
         payload.append(row)
-    return jsonify({"links": payload}), 200
+    # The cap travels with the list so the dashboard never hardcodes its own copy.
+    return jsonify({
+        "links": payload,
+        "used": len(payload),
+        "maxLinks": Config.MAX_LINKS_PER_AFFILIATE,
+    }), 200
 
 
 @auth_bp.route("/affiliate/links", methods=["POST"])
@@ -161,13 +211,234 @@ def create_affiliate_link_route():
         return jsonify({"error": "not_found", "message": "Affiliate profile missing."}), 404
 
     body = request.get_json(silent=True) or {}
-    link = create_link(
-        affiliate=user.affiliate,
-        markup_percent=body.get("markupPercent", 0),
-        label=body.get("label", ""),
-    )
+    product_id = body.get("productId")
+    try:
+        link = create_link(
+            affiliate=user.affiliate,
+            markup_percent=body.get("markupPercent", 0),
+            label=body.get("label", ""),
+            product_odoo_id=int(product_id) if product_id else None,
+        )
+    except LinkLimitReached as exc:
+        return jsonify({"error": "link_limit_reached", "message": str(exc)}), 409
     # A link nobody has clicked yet, stated rather than left for the caller to guess.
     return jsonify({"link": {**link.as_dict(), "sales": 0, "earnings": 0.0, "currency": None}}), 201
+
+
+@auth_bp.route("/affiliate/links/<backend_ref>", methods=["DELETE"])
+@require_approved_affiliate
+def delete_affiliate_link_route(backend_ref: str):
+    user: User = g.current_user
+    if not user.affiliate:
+        return jsonify({"error": "not_found", "message": "Affiliate profile missing."}), 404
+
+    # Scoped to this affiliate's own links, so a guessed reference from
+    # someone else's account finds nothing.
+    link = AffiliateLink.query.filter_by(
+        backend_ref=backend_ref, affiliate_id=user.affiliate.id
+    ).first()
+    if not link:
+        return jsonify({"error": "not_found", "message": "No such link."}), 404
+
+    try:
+        outcome = delete_link(link)
+    except StoreNotConfigured as exc:
+        return jsonify({"error": "store_not_configured", "message": str(exc)}), 503
+    except Exception:
+        log.warning("Could not retire link %s", backend_ref, exc_info=True)
+        return jsonify({
+            "error": "store_unreachable",
+            "message": "We could not switch this link off in the store, so it has been left "
+                       "active. Please try again shortly.",
+        }), 502
+
+    return jsonify({"outcome": outcome}), 200
+
+
+@auth_bp.route("/notifications", methods=["GET"])
+@require_auth
+def notifications_route():
+    """This person's notices. Serves affiliates and admins alike."""
+    user: User = g.current_user
+    limit = min(100, max(1, int(request.args.get("limit", 50))))
+    rows = (Notification.query.filter_by(user_id=user.id)
+            .order_by(Notification.created_at.desc(), Notification.id.desc())
+            .limit(limit).all())
+    return jsonify({
+        "notifications": [r.as_dict() for r in rows],
+        "unread": unread_count(user.id),
+    }), 200
+
+
+@auth_bp.route("/notifications/read", methods=["POST"])
+@require_auth
+def mark_notifications_read_route():
+    """Mark some notices read, or all of them when none are named."""
+    user: User = g.current_user
+    body = request.get_json(silent=True) or {}
+    ids = body.get("ids")
+    query = Notification.query.filter_by(user_id=user.id, read_at=None)
+    if ids:
+        query = query.filter(Notification.id.in_(ids))
+    now = utcnow()
+    changed = 0
+    for row in query.all():
+        row.read_at = now
+        changed += 1
+    db.session.commit()
+    return jsonify({"read": changed, "unread": unread_count(user.id)}), 200
+
+
+@auth_bp.route("/banks", methods=["GET"])
+@require_auth
+def banks_route():
+    """The banks a payout can actually be sent to.
+
+    Signed-in users only. It is not secret, but it costs us a call to
+    Paystack and there is no reason to let the open internet spend it.
+    """
+    try:
+        return jsonify({"banks": list_banks()}), 200
+    except PaystackError as exc:
+        log.warning("bank list unavailable: %s", exc)
+        return jsonify({
+            "error": "banks_unavailable",
+            "message": "We could not load the bank list just now. Please try again shortly.",
+        }), 503
+
+
+@auth_bp.route("/affiliate/payout-account/resolve", methods=["POST"])
+@require_approved_affiliate
+def resolve_payout_account_route():
+    """Ask the bank who owns an account number, before anyone saves it.
+
+    This is what stops money going to a mistyped account: the affiliate sees
+    the name on the account and can tell at a glance whether it is theirs.
+    Nothing is stored here — it is a question, not a change.
+    """
+    body = request.get_json(silent=True) or {}
+    number = (body.get("accountNumber") or "").strip()
+    code = (body.get("bankCode") or "").strip()
+    if not (number and code):
+        return jsonify({
+            "error": "incomplete",
+            "message": "We need both the account number and the bank.",
+        }), 400
+    if not number.isdigit() or not (8 <= len(number) <= 20):
+        return jsonify({
+            "error": "bad_account_number",
+            "message": "An account number should be 8 to 20 digits.",
+        }), 400
+    try:
+        name = resolve_account(number, code)
+    except PaystackNotConfigured as exc:
+        log.warning("account resolve unavailable: %s", exc)
+        return jsonify({
+            "error": "not_configured",
+            "message": "Account checking is not switched on yet.",
+        }), 503
+    except PaystackError as exc:
+        # Paystack's own wording here is the useful part ("Could not resolve
+        # account name"), so it is passed through rather than replaced.
+        return jsonify({"error": "unresolved", "message": str(exc)}), 400
+    return jsonify({"accountName": name}), 200
+
+
+@auth_bp.route("/affiliate/payout-account", methods=["GET", "PUT"])
+@require_approved_affiliate
+def affiliate_payout_account_route():
+    """Where this affiliate's money should be sent."""
+    user: User = g.current_user
+    affiliate = user.affiliate
+    if not affiliate:
+        return jsonify({"error": "not_found", "message": "Affiliate profile missing."}), 404
+
+    if request.method == "PUT":
+        body = request.get_json(silent=True) or {}
+        number = (body.get("accountNumber") or "").strip()
+        code = (body.get("bankCode") or "").strip()
+        if not (number and code):
+            return jsonify({
+                "error": "incomplete",
+                "message": "We need the account number and the bank.",
+            }), 400
+        if not number.isdigit() or not (8 <= len(number) <= 20):
+            return jsonify({
+                "error": "bad_account_number",
+                "message": "An account number should be 8 to 20 digits.",
+            }), 400
+
+        # The bank's own record decides whose name is on the account. A name
+        # sent by the browser is a claim, not a fact, and storing it would
+        # let somebody label an account as anyone they liked — then point at
+        # that label when the money went to the wrong place.
+        try:
+            resolved_name = resolve_account(number, code)
+            bank_name = next((b["name"] for b in list_banks() if b["code"] == code), "")
+        except PaystackNotConfigured as exc:
+            log.warning("payout account not verifiable: %s", exc)
+            return jsonify({
+                "error": "not_configured",
+                "message": "We can't check bank details just now, so we haven't saved them.",
+            }), 503
+        except PaystackError as exc:
+            return jsonify({"error": "unresolved", "message": str(exc)}), 400
+
+        if not bank_name:
+            return jsonify({
+                "error": "bad_bank",
+                "message": "That isn't a bank we can send a payout to.",
+            }), 400
+
+        # Pointing at a different account makes the recipient Paystack already
+        # holds for the old one wrong. Left in place it would quietly send the
+        # next payout to the account this change was meant to replace.
+        if affiliate.bank_account_number != number or affiliate.bank_code != code:
+            affiliate.paystack_recipient_code = None
+
+        affiliate.bank_account_name = resolved_name
+        affiliate.bank_account_number = number
+        affiliate.bank_code = code
+        affiliate.bank_name = bank_name
+        db.session.commit()
+
+    return jsonify({"account": {
+        "accountName": affiliate.bank_account_name or "",
+        "bankName": affiliate.bank_name or "",
+        "bankCode": affiliate.bank_code or "",
+        # Never echoed in full once stored; enough to recognise, not to reuse.
+        "accountNumberLast4": (affiliate.bank_account_number or "")[-4:],
+        "complete": bool(affiliate.bank_account_number and affiliate.bank_code
+                         and affiliate.bank_account_name),
+    }}), 200
+
+
+@auth_bp.route("/affiliate/payouts", methods=["GET"])
+@require_approved_affiliate
+def affiliate_payouts_route():
+    user: User = g.current_user
+    if not user.affiliate:
+        return jsonify({"payouts": [], "balance": None}), 200
+    payouts = (Payout.query.filter_by(affiliate_id=user.affiliate.id)
+               .order_by(Payout.id.desc()).all())
+    return jsonify({
+        "payouts": [p.as_dict() for p in payouts],
+        "balance": payable_balance(user.affiliate.id),
+    }), 200
+
+
+@auth_bp.route("/affiliate/payouts", methods=["POST"])
+@require_approved_affiliate
+def request_payout_route():
+    user: User = g.current_user
+    if not user.affiliate:
+        return jsonify({"error": "not_found", "message": "Affiliate profile missing."}), 404
+    body = request.get_json(silent=True) or {}
+    try:
+        payout = request_payout(user.affiliate, note=body.get("note", ""))
+    except PayoutError as exc:
+        return jsonify({"error": "not_payable", "message": str(exc)}), 409
+    return jsonify({"payout": payout.as_dict()}), 201
 
 
 @auth_bp.route("/affiliate/earnings", methods=["GET"])
@@ -217,9 +488,6 @@ def admin_list_affiliates():
             "status": u.status,
             "isMember": u.is_member,
             "rejectionReason": u.rejection_reason,
-            "promotionalChannel": u.promotional_channel or "",
-            "channelUrl": u.channel_url or "",
-            "audienceSize": u.audience_size or "",
             "whyJoin": u.why_join or "",
             "affiliateRef": aff.backend_ref if aff else None,
             "odooAffiliateId": aff.odoo_affiliate_id if aff else None,
@@ -298,7 +566,7 @@ def admin_list_earnings():
         db.session.query(
             Earning.status,
             func.count(Earning.id),
-            func.coalesce(func.sum(Earning.earning), 0),
+            func.coalesce(func.sum(amount_due()), 0),
         )
         .group_by(Earning.status)
         .all()
@@ -314,6 +582,141 @@ def admin_list_earnings():
             for state, count, amount in sums
         },
     }), 200
+
+
+@auth_bp.route("/admin/earnings/approvable", methods=["GET"])
+@require_admin
+def admin_approvable_earnings_route():
+    """Earnings old enough to be treated as genuinely owed."""
+    rows = approvable_earnings()
+    return jsonify({
+        "earnings": [r.as_dict() for r in rows],
+        "holdDays": Config.EARNING_HOLD_DAYS,
+    }), 200
+
+
+@auth_bp.route("/admin/earnings/approve", methods=["POST"])
+@require_admin
+def admin_approve_earnings_route():
+    """Approve specific earnings, or every one that is past the hold."""
+    body = request.get_json(silent=True) or {}
+    refs = body.get("orderRefs")
+    if refs:
+        rows = Earning.query.filter(Earning.odoo_order_ref.in_(refs),
+                                    Earning.status == "pending").all()
+    else:
+        rows = approvable_earnings()
+    return jsonify({"approved": approve_earnings(rows)}), 200
+
+
+@auth_bp.route("/admin/payouts", methods=["GET"])
+@require_admin
+def admin_payouts_route():
+    status = request.args.get("status", "").strip().lower()
+    query = Payout.query
+    if status and status != "all":
+        query = query.filter_by(status=status)
+    payouts = query.order_by(Payout.id.desc()).limit(200).all()
+    return jsonify({"payouts": [
+        {**p.as_dict(),
+         "affiliateName": p.affiliate.name if p.affiliate else "",
+         "affiliateRef": p.affiliate.backend_ref if p.affiliate else ""}
+        for p in payouts
+    ]}), 200
+
+
+@auth_bp.route("/admin/payouts/<reference>/send", methods=["POST"])
+@require_admin
+def admin_send_payout_route(reference: str):
+    """Actually send this payout's money through Paystack.
+
+    Unlike `/paid`, this one moves money. It either completes, or comes back
+    waiting for the confirmation code Paystack has sent to the account owner.
+    """
+    payout = Payout.query.filter_by(reference=reference).first()
+    if not payout:
+        return jsonify({"error": "not_found", "message": "No such payout."}), 404
+    try:
+        send_payout(payout)
+    except PayoutError as exc:
+        return jsonify({"error": "not_sendable", "message": str(exc)}), 409
+    return jsonify({"payout": payout.as_dict()}), 200
+
+
+@auth_bp.route("/admin/payouts/<reference>/confirm-otp", methods=["POST"])
+@require_admin
+def admin_confirm_payout_otp_route(reference: str):
+    """Release a transfer Paystack is holding, with the code it sent."""
+    payout = Payout.query.filter_by(reference=reference).first()
+    if not payout:
+        return jsonify({"error": "not_found", "message": "No such payout."}), 404
+    body = request.get_json(silent=True) or {}
+    try:
+        confirm_payout_otp(payout, body.get("otp", ""))
+    except PayoutError as exc:
+        return jsonify({"error": "otp_rejected", "message": str(exc)}), 409
+    return jsonify({"payout": payout.as_dict()}), 200
+
+
+@auth_bp.route("/admin/payouts/<reference>/resend-otp", methods=["POST"])
+@require_admin
+def admin_resend_payout_otp_route(reference: str):
+    payout = Payout.query.filter_by(reference=reference).first()
+    if not payout:
+        return jsonify({"error": "not_found", "message": "No such payout."}), 404
+    try:
+        resend_payout_otp(payout)
+    except PayoutError as exc:
+        return jsonify({"error": "not_resendable", "message": str(exc)}), 409
+    return jsonify({"sent": True}), 200
+
+
+@auth_bp.route("/admin/payouts/<reference>/reconcile", methods=["POST"])
+@require_admin
+def admin_reconcile_payout_route(reference: str):
+    """Make our record agree with Paystack's. Never sends anything."""
+    payout = Payout.query.filter_by(reference=reference).first()
+    if not payout:
+        return jsonify({"error": "not_found", "message": "No such payout."}), 404
+    try:
+        reconcile_payout(payout)
+    except PayoutError as exc:
+        return jsonify({"error": "not_reconcilable", "message": str(exc)}), 409
+    return jsonify({"payout": payout.as_dict()}), 200
+
+
+@auth_bp.route("/admin/payouts/<reference>/paid", methods=["POST"])
+@require_admin
+def admin_mark_payout_paid_route(reference: str):
+    """Record that this payout has been sent from the bank.
+
+    This does not move money; it states that money was moved. Keeping those
+    apart is deliberate — see payout_service.mark_paid.
+    """
+    payout = Payout.query.filter_by(reference=reference).first()
+    if not payout:
+        return jsonify({"error": "not_found", "message": "No such payout."}), 404
+    body = request.get_json(silent=True) or {}
+    try:
+        mark_paid(payout, provider_reference=body.get("reference", ""),
+                  note=body.get("note", ""))
+    except PayoutError as exc:
+        return jsonify({"error": "not_payable", "message": str(exc)}), 409
+    return jsonify({"payout": payout.as_dict()}), 200
+
+
+@auth_bp.route("/admin/payouts/<reference>/failed", methods=["POST"])
+@require_admin
+def admin_mark_payout_failed_route(reference: str):
+    payout = Payout.query.filter_by(reference=reference).first()
+    if not payout:
+        return jsonify({"error": "not_found", "message": "No such payout."}), 404
+    body = request.get_json(silent=True) or {}
+    try:
+        fail_payout(payout, body.get("reason", ""))
+    except PayoutError as exc:
+        return jsonify({"error": "not_failable", "message": str(exc)}), 409
+    return jsonify({"payout": payout.as_dict()}), 200
 
 
 @auth_bp.route("/admin/affiliates/<int:target_id>", methods=["GET"])
@@ -335,9 +738,6 @@ def admin_affiliate_detail(target_id: int):
             "status": user.status,
             "isMember": user.is_member,
             "rejectionReason": user.rejection_reason,
-            "promotionalChannel": user.promotional_channel or "",
-            "channelUrl": user.channel_url or "",
-            "audienceSize": user.audience_size or "",
             "whyJoin": user.why_join or "",
             "affiliateRef": affiliate.backend_ref if affiliate else None,
             "odooAffiliateId": affiliate.odoo_affiliate_id if affiliate else None,
@@ -447,33 +847,6 @@ def signup_page():
         </div>
 
         <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
-          <div>
-            <label class="block text-xs font-medium text-gray-300 mb-1">Promotional Channel *</label>
-            <select name="promotionalChannel" required
-              class="w-full px-3.5 py-2.5 rounded-lg bg-gray-800 border border-gray-700 text-white text-sm focus:outline-none focus:border-emerald-500">
-              <option value="">Select your channel...</option>
-              <option value="Instagram">Instagram</option>
-              <option value="TikTok">TikTok</option>
-              <option value="YouTube">YouTube</option>
-              <option value="Blog / Website">Blog / Website</option>
-              <option value="WhatsApp Community">WhatsApp Community</option>
-              <option value="Twitter/X">Twitter/X</option>
-              <option value="Other">Other</option>
-            </select>
-          </div>
-          <div>
-            <label class="block text-xs font-medium text-gray-300 mb-1">Link to Channel *</label>
-            <input type="url" name="channelUrl" required placeholder="https://instagram.com/yourhandle"
-              class="w-full px-3.5 py-2.5 rounded-lg bg-gray-800 border border-gray-700 text-white placeholder-gray-500 text-sm focus:outline-none focus:border-emerald-500">
-          </div>
-        </div>
-
-        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
-          <div>
-            <label class="block text-xs font-medium text-gray-300 mb-1">Audience Size *</label>
-            <input type="text" name="audienceSize" required placeholder="e.g. 10,000 followers"
-              class="w-full px-3.5 py-2.5 rounded-lg bg-gray-800 border border-gray-700 text-white placeholder-gray-500 text-sm focus:outline-none focus:border-emerald-500">
-          </div>
           <div>
             <label class="block text-xs font-medium text-gray-300 mb-1">Phone Number (Optional)</label>
             <input type="tel" name="phone" placeholder="+234 801 234 5678"
@@ -749,43 +1122,7 @@ def admin_approvals_page():
             <td class="py-3 px-3">
               <div class="font-medium text-white">${a.name}</div>
               <div class="text-gray-400 text-xs">${a.email} ${a.phone ? '• ' + a.phone : ''}</div>
-              ${a.promotionalChannel ? `
-                <div class="mt-1 text-[11px] text-emerald-300">
-                  <span class="font-semibold text-gray-300">Channel:</span> ${a.promotionalChannel}
-                  ${a.channelUrl ? `(<a href="${a.channelUrl}" target="_blank" class="underline text-emerald-400 hover:text-emerald-300">Link</a>)` : ''}
-                  ${a.audienceSize ? `• <span class="font-semibold text-gray-300">Audience:</span> ${a.audienceSize}` : ''}
-                </div>
-              ` : ''}
-              ${a.whyJoin ? `
-                <div class="mt-1 text-[11px] text-gray-400 italic bg-gray-800/40 p-1.5 rounded max-w-md">
-                  "${a.whyJoin}"
-                </div>
-              ` : ''}
-            </td>
-            <td class="py-3 px-3">
-              <span class="px-2 py-0.5 rounded text-[11px] font-semibold ${
-                a.status === 'approved' ? 'bg-emerald-950 text-emerald-400 border border-emerald-800' :
-                a.status === 'pending' ? 'bg-amber-950 text-amber-400 border border-amber-800' :
-                'bg-red-950 text-red-400 border border-red-800'
-              }">${a.status}</span>
-            </td>
-            <td class="py-3 px-3 text-gray-400">
-              ${a.synced ? '<span class="text-emerald-400">Synced to Odoo</span>' : '<span class="text-gray-500">Not synced</span>'}
-            </td>
-            <td class="py-3 px-3 text-gray-400">${a.joinedAt ? new Date(a.joinedAt).toLocaleDateString() : 'N/A'}</td>
-            <td class="py-3 px-3 text-right">
-              ${a.status === 'pending' ? `
-                <div class="flex justify-end gap-2">
-                  <button onclick="approve(${a.id})" class="px-2.5 py-1 bg-emerald-500 hover:bg-emerald-400 text-black font-semibold rounded text-xs transition">
-                    Approve
-                  </button>
-                  <button onclick="reject(${a.id})" class="px-2.5 py-1 bg-red-900/60 hover:bg-red-800 text-red-200 font-semibold rounded text-xs transition">
-                    Reject
-                  </button>
-                </div>
-              ` : `
-                <span class="text-gray-500 text-xs">${a.status}</span>
-              `}
+
             </td>
           </tr>
         `).join('');
@@ -827,3 +1164,168 @@ def admin_approvals_page():
     </script>
     """
     return render_template_string(HTML_PAGE_TEMPLATE, title="Admin Approvals", content=content)
+
+
+# --------------------------------------------------------------------------- #
+# Campaigns
+# --------------------------------------------------------------------------- #
+
+def _parse_date_input(value):
+    """A date or date-and-time as a browser submits it.
+
+    Deliberately not `affiliate_service._parse_dt`, which only understands
+    the two shapes Odoo sends. A date field posts "2026-10-10" and a
+    datetime-local field posts "2026-10-10T14:30", neither of which that one
+    accepts — it would return None and the campaign would silently have no
+    start date.
+
+    A bare date means the start of that day. Anything without a timezone is
+    taken as UTC, which is what the rest of this service stores.
+    """
+    if not value:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _campaign_from_body(campaign: Campaign, body: dict) -> str | None:
+    """Apply a submitted campaign, or return why it cannot be applied."""
+    name = (body.get("name") or "").strip()
+    if not name:
+        return "Give the campaign a name."
+    reward_type = (body.get("rewardType") or "percent").strip()
+    if reward_type not in ("percent", "fixed"):
+        return "A reward is either a percentage of the sale or a fixed amount per item."
+    try:
+        reward_value = float(body.get("rewardValue") or 0)
+    except (TypeError, ValueError):
+        return "The reward must be a number."
+    if reward_value <= 0:
+        return "The reward must be more than zero."
+    if reward_type == "percent" and reward_value > 100:
+        return "A percentage reward cannot be over 100%."
+
+    starts = _parse_date_input(body.get("startsAt"))
+    ends = _parse_date_input(body.get("endsAt"))
+    if starts and ends and ends < starts:
+        return "The campaign cannot end before it starts."
+
+    products = body.get("products")
+    if not isinstance(products, list) or not products:
+        return "Choose at least one product for this campaign to reward."
+
+    campaign.name = name[:255]
+    campaign.description = (body.get("description") or "").strip()[:1000] or None
+    campaign.reward_type = reward_type
+    campaign.reward_value = reward_value
+    campaign.starts_at = starts
+    campaign.ends_at = ends
+    if "active" in body:
+        campaign.active = bool(body.get("active"))
+
+    campaign.products.clear()
+    for row in products:
+        if not isinstance(row, dict):
+            continue
+        product_id = row.get("productId")
+        tmpl_id = row.get("productTmplId")
+        if product_id is None and tmpl_id is None:
+            continue
+        campaign.products.append(CampaignProduct(
+            product_odoo_id=int(product_id) if product_id is not None else None,
+            product_tmpl_id=int(tmpl_id) if tmpl_id is not None else None,
+            name=(row.get("name") or "")[:512] or None,
+        ))
+    if not campaign.products:
+        return "None of those products could be used."
+    return None
+
+
+@auth_bp.route("/admin/campaigns", methods=["GET"])
+@require_admin
+def admin_list_campaigns_route():
+    rows = Campaign.query.order_by(Campaign.id.desc()).all()
+    return jsonify({"campaigns": [c.as_dict() for c in rows]}), 200
+
+
+@auth_bp.route("/admin/campaigns", methods=["POST"])
+@require_admin
+def admin_create_campaign_route():
+    body = request.get_json(silent=True) or {}
+    campaign = Campaign()
+    problem = _campaign_from_body(campaign, body)
+    if problem:
+        return jsonify({"error": "invalid", "message": problem}), 400
+    db.session.add(campaign)
+    db.session.commit()
+    log.info("Campaign %s created (%s %s)", campaign.name,
+             campaign.reward_value, campaign.reward_type)
+    # A campaign nobody is told about changes nobody's behaviour. One that
+    # starts later is announced by the sweep on the affiliate page instead.
+    announce_live_campaigns()
+    return jsonify({"campaign": campaign.as_dict()}), 201
+
+
+@auth_bp.route("/admin/campaigns/<int:campaign_id>", methods=["PUT"])
+@require_admin
+def admin_update_campaign_route(campaign_id: int):
+    campaign = db.session.get(Campaign, campaign_id)
+    if not campaign:
+        return jsonify({"error": "not_found", "message": "No such campaign."}), 404
+    problem = _campaign_from_body(campaign, request.get_json(silent=True) or {})
+    if problem:
+        return jsonify({"error": "invalid", "message": problem}), 400
+    db.session.commit()
+    # Said plainly in the response: an edit changes what happens next, and
+    # never what has already been earned.
+    return jsonify({
+        "campaign": campaign.as_dict(),
+        "note": "Earnings already recorded keep the terms they were sold under.",
+    }), 200
+
+
+@auth_bp.route("/admin/campaigns/<int:campaign_id>", methods=["DELETE"])
+@require_admin
+def admin_stop_campaign_route(campaign_id: int):
+    """Switch a campaign off. Never deletes it.
+
+    Earnings point at the campaign that paid them, and that history has to
+    stay readable, so stopping is a flag rather than a removal.
+    """
+    campaign = db.session.get(Campaign, campaign_id)
+    if not campaign:
+        return jsonify({"error": "not_found", "message": "No such campaign."}), 404
+    campaign.active = False
+    db.session.commit()
+    return jsonify({"campaign": campaign.as_dict()}), 200
+
+
+@auth_bp.route("/affiliate/product-rewards", methods=["GET"])
+@require_approved_affiliate
+def affiliate_product_rewards_route():
+    """What each campaign product pays, keyed by product id.
+
+    Separate from the campaigns list because the product grid needs it per
+    product, and the amount depends on each product's own price.
+    """
+    return jsonify({"rewards": rewards_by_product()}), 200
+
+
+@auth_bp.route("/affiliate/campaigns", methods=["GET"])
+@require_approved_affiliate
+def affiliate_campaigns_route():
+    """What is on offer right now. A campaign nobody knows about changes nothing."""
+    # Catches a campaign that was scheduled and has since started; there is
+    # no clock on this service to do it on the hour.
+    announce_live_campaigns()
+    return jsonify({"campaigns": [c.as_dict() for c in live_campaigns()]}), 200

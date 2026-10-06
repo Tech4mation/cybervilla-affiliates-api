@@ -21,6 +21,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 
 from affiliate_service import _push_affiliate
 from config import Config
+from notification_service import notify, notify_admins
 from models import Affiliate, User, db, utcnow
 
 log = logging.getLogger(__name__)
@@ -181,9 +182,6 @@ def signup_affiliate(
     email: str,
     password: str,
     phone: str = "",
-    promotional_channel: str = "",
-    channel_url: str = "",
-    audience_size: str = "",
     why_join: str = "",
 ) -> Tuple[User, Affiliate]:
     """Register a new affiliate applicant.
@@ -209,9 +207,6 @@ def signup_affiliate(
         raise ValueError("An account with this email address already exists.")
 
     cleaned_phone = (phone or "").strip() or None
-    cleaned_channel = (promotional_channel or "").strip() or None
-    cleaned_url = (channel_url or "").strip() or None
-    cleaned_size = str(audience_size or "").strip() or None
     cleaned_why = (why_join or "").strip() or None
 
     # Create affiliate row in pending state
@@ -233,9 +228,6 @@ def signup_affiliate(
         phone=cleaned_phone,
         role="affiliate",
         status="pending",
-        promotional_channel=cleaned_channel,
-        channel_url=cleaned_url,
-        audience_size=cleaned_size,
         why_join=cleaned_why,
         affiliate_id=affiliate.id,
     )
@@ -244,6 +236,12 @@ def signup_affiliate(
 
     db.session.commit()
     log.info("New affiliate applicant registered: %s (%s), status=pending", user.name, user.email)
+    notify_admins(
+        "application.received",
+        f"{user.name} applied to be an affiliate",
+        "Review the application and approve or reject it.",
+        "/admin/affiliates",
+    )
     return user, affiliate
 
 
@@ -343,6 +341,12 @@ def approve_affiliate(affiliate_or_user_id: int) -> Tuple[User, Affiliate]:
 
     db.session.commit()
     log.info("Affiliate approved by admin: %s (AFF-%s)", user.email, affiliate.id)
+    notify(
+        user.id, "account.approved",
+        "Your application was approved",
+        "You can now create links and start earning.",
+        "/links",
+    )
     return user, affiliate
 
 
@@ -364,4 +368,10 @@ def reject_affiliate(affiliate_or_user_id: int, reason: str = "") -> Tuple[User,
 
     db.session.commit()
     log.info("Affiliate rejected by admin: %s. Reason: %s", user.email, user.rejection_reason)
+    notify(
+        user.id, "account.rejected",
+        "Your application was not approved",
+        user.rejection_reason or "",
+        "/signin",
+    )
     return user, affiliate

@@ -58,12 +58,14 @@ def create_app(config_object: type = Config) -> Flask:
     from product_routes import product_bp
     from affiliate_routes import affiliate_bp
     from webhook_routes import webhook_bp
+    from paystack_webhook_routes import paystack_webhook_bp
     from auth_routes import auth_bp
 
     app.register_blueprint(health_bp)
     app.register_blueprint(product_bp)
     app.register_blueprint(affiliate_bp)
     app.register_blueprint(webhook_bp)
+    app.register_blueprint(paystack_webhook_bp)
     app.register_blueprint(auth_bp)
 
     @app.route("/", methods=["GET"])

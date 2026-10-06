@@ -58,6 +58,32 @@ class Config:
     # Odoo, so a bad markup is stopped before it is ever pushed to the store.
     MAX_MARKUP_PERCENT = _int("MAX_MARKUP_PERCENT", 10)
 
+    # How many live links one affiliate may hold. Counted over active links
+    # only, so deleting one frees a slot.
+    MAX_LINKS_PER_AFFILIATE = _int("MAX_LINKS_PER_AFFILIATE", 4)
+
+    # --- Payouts -----------------------------------------------------------
+    # The least an affiliate may be paid at once. Small balances roll over
+    # rather than being paid, because every transfer costs a fee.
+    MIN_PAYOUT_AMOUNT = _int("MIN_PAYOUT_AMOUNT", 50000)
+
+    # How long after a sale before its earning may be approved. An order can
+    # still be cancelled or refunded inside this window, and money already
+    # paid out is far harder to recover than money not yet sent.
+    EARNING_HOLD_DAYS = _int("EARNING_HOLD_DAYS", 5)
+
+    # --- Paystack (sending money) ----------------------------------------
+    # The key prefix is the only thing that separates a simulated transfer
+    # from one that empties a real bank account: same code, same endpoints,
+    # same responses. So a live key is refused unless someone has *also*
+    # said, separately and deliberately, that live transfers are intended.
+    # See `paystack_refusal`.
+    PAYSTACK_SECRET_KEY = (os.getenv("PAYSTACK_SECRET_KEY") or "").strip()
+    PAYSTACK_ALLOW_LIVE = (os.getenv("PAYSTACK_ALLOW_LIVE") or "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+    PAYSTACK_TIMEOUT_SECONDS = _int("PAYSTACK_TIMEOUT_SECONDS", 30)
+
     # --- Authentication & Admin ------------------------------------------
     # No defaults here, deliberately. A fallback secret in source is a secret
     # everyone has: it signs every session token, so anyone who can read this
@@ -89,6 +115,33 @@ class Config:
         if not cls.ADMIN_PASSWORD:
             missing.append("ADMIN_PASSWORD")
         return missing
+
+    @classmethod
+    def paystack_is_configured(cls) -> bool:
+        """Whether we hold a key at all. Without one, payouts stay manual."""
+        return bool(cls.PAYSTACK_SECRET_KEY)
+
+    @classmethod
+    def paystack_is_live(cls) -> bool:
+        """Whether this key moves real money."""
+        return cls.PAYSTACK_SECRET_KEY.startswith("sk_live_")
+
+    @classmethod
+    def paystack_refusal(cls) -> str | None:
+        """Why automated transfers must not run, or None when they may.
+
+        A live key that nobody explicitly asked for is the one mistake here
+        that cannot be undone by fixing a row, so it is treated as a
+        misconfiguration and stops transfers rather than being assumed
+        intentional.
+        """
+        if cls.paystack_is_live() and not cls.PAYSTACK_ALLOW_LIVE:
+            return (
+                "PAYSTACK_SECRET_KEY is a LIVE key but PAYSTACK_ALLOW_LIVE is not set. "
+                "Refusing to send real money by accident. Set PAYSTACK_ALLOW_LIVE=true "
+                "only if live transfers are genuinely intended."
+            )
+        return None
 
     @classmethod
     def store_is_configured(cls) -> bool:

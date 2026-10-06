@@ -19,6 +19,7 @@ from the store, because only the store knows when the money actually landed.
 from datetime import datetime, timedelta, timezone
 
 from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import func
 from werkzeug.security import check_password_hash, generate_password_hash
 
 db = SQLAlchemy()
@@ -175,6 +176,7 @@ class Affiliate(db.Model):
     # Where a payout goes. Verified against Paystack's account-name lookup at
     # approval time, before any money is owed. recipient_code is filled in when
     # the Paystack transfer recipient is created (a later piece of work).
+    bank_name = db.Column(db.String(128))
     bank_code = db.Column(db.String(16))
     bank_account_number = db.Column(db.String(32))
     bank_account_name = db.Column(db.String(255))
@@ -189,6 +191,9 @@ class Affiliate(db.Model):
 
     links = db.relationship("AffiliateLink", back_populates="affiliate",
                             cascade="all, delete-orphan")
+    # Payouts are money that moved; they are never cascade-deleted with an
+    # affiliate, because the record of a payment has to outlive the account.
+    payouts = db.relationship("Payout", back_populates="affiliate")
 
     def as_dict(self) -> dict:
         return {
@@ -226,6 +231,8 @@ class User(db.Model):
     rejection_reason = db.Column(db.String(500))
 
     # Prospective affiliate application details
+    # No longer asked for at sign-up. Kept so applications made before that
+    # change keep their answers; nothing writes these now.
     promotional_channel = db.Column(db.String(128))
     channel_url = db.Column(db.String(512))
     audience_size = db.Column(db.String(64))
@@ -264,9 +271,6 @@ class User(db.Model):
             "role": self.role,
             "status": self.status,
             "isMember": self.is_member,
-            "promotionalChannel": self.promotional_channel or "",
-            "channelUrl": self.channel_url or "",
-            "audienceSize": self.audience_size or "",
             "whyJoin": self.why_join or "",
             "rejectionReason": self.rejection_reason,
             "affiliateId": self.affiliate.backend_ref if self.affiliate else None,
@@ -277,11 +281,11 @@ class User(db.Model):
 class AffiliateLink(db.Model):
     """A shareable code that prices the shop at one affiliate's markup.
 
-    Every link is storewide — the markup applies to whatever the buyer ends up
-    with, not one product. (``target_type``/``product_odoo_id`` remain on the
-    table from an earlier per-product design; nothing sets them anymore.) The
-    store builds the actual pricelist from the markup; here we only remember
-    what was asked for and what the store said it applied.
+    A link may name a product, but that only decides where the visitor lands.
+    The markup is never narrowed to it: whatever the buyer ends up with is
+    priced at the link's markup, and the affiliate earns on it. The store
+    builds the actual pricelist; here we only remember what was asked for and
+    what the store said it applied.
     """
 
     __tablename__ = "affiliate_link"
@@ -317,6 +321,18 @@ class AffiliateLink(db.Model):
         store_url = Config.ODOO_URL.rstrip("/") if Config.ODOO_URL else "https://cybervilla.io"
         return f"{store_url}/r/{self.code}"
 
+    def product_name(self) -> str | None:
+        """The name of the product this link lands on, if it names one.
+
+        Looked up rather than stored, so a renamed product reads correctly.
+        A product the store has since withdrawn is still in our mirror, but
+        guard for it having gone entirely.
+        """
+        if not self.product_odoo_id:
+            return None
+        found = Product.query.filter_by(odoo_id=self.product_odoo_id).first()
+        return found.name if found else None
+
     def as_dict(self) -> dict:
         return {
             "id": self.backend_ref,
@@ -325,10 +341,135 @@ class AffiliateLink(db.Model):
             "url": self.url(),
             "targetType": "Product" if self.target_type == "product" else "Storewide",
             "productId": self.product_odoo_id,
+            "productName": self.product_name(),
             "markupPercent": float(self.markup_percent or 0),
             "active": bool(self.active),
             "synced": self.odoo_link_id is not None,
             "createdAt": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class Notification(db.Model):
+    """Something worth telling one person about, shown in their bell.
+
+    Addressed to a `User` rather than an affiliate, so the same table serves
+    admins ("a payout is waiting") and affiliates ("you were paid") without
+    two of everything.
+
+    These are written as a side effect of things that have already happened,
+    so writing one must never be allowed to fail the thing it describes —
+    see `notification_service.notify`.
+    """
+
+    __tablename__ = "notification"
+
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False, index=True)
+
+    # A stable machine name for the event, e.g. "payout.paid". Kept separate
+    # from the wording so the text can be reworded without breaking anything
+    # that counts or filters by type.
+    kind = db.Column(db.String(48), nullable=False, index=True)
+    title = db.Column(db.String(255), nullable=False)
+    body = db.Column(db.String(1024))
+    # Where clicking it should go, if anywhere.
+    href = db.Column(db.String(255))
+
+    read_at = db.Column(db.DateTime(timezone=True))
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow, index=True)
+
+    def as_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "kind": self.kind,
+            "title": self.title,
+            "body": self.body or "",
+            "href": self.href,
+            "read": self.read_at is not None,
+            "createdAt": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class Payout(db.Model):
+    """One payment of an affiliate's approved earnings.
+
+    A payout is a record of money owed and then moved, and it names exactly
+    which earnings it covers — `Earning.payout_id` points back here. That
+    link is what makes the figures auditable: every naira paid can be traced
+    to the orders it came from, and an earning can never be paid twice
+    because attaching it to a payout is what marks it paid.
+
+    The provider fields are left empty when someone pays by hand and filled
+    in when a transfer is made through Paystack, so both ways of paying leave
+    the same shape of record behind.
+    """
+
+    __tablename__ = "payout"
+
+    id = db.Column(db.Integer, primary_key=True)
+    # Ours, shown to people: "PO-12".
+    reference = db.Column(db.String(64), unique=True, index=True)
+
+    affiliate_id = db.Column(db.Integer, db.ForeignKey("affiliate.id"),
+                             nullable=False, index=True)
+    affiliate = db.relationship("Affiliate", back_populates="payouts")
+
+    amount = db.Column(db.Numeric(14, 2), nullable=False)
+    currency = db.Column(db.String(8))
+
+    # "bank_transfer" once money moves through Paystack; "manual" when someone
+    # pays from the bank themselves and records it here.
+    method = db.Column(db.String(32), nullable=False, default="manual")
+
+    # requested -> [awaiting_otp] -> processing -> paid, or failed / cancelled.
+    # awaiting_otp only occurs while Paystack is configured to require a
+    # confirmation code per transfer; with that off, sending goes straight to
+    # processing. Nothing is ever deleted; a failed payout releases its
+    # earnings again.
+    status = db.Column(db.String(16), nullable=False, default="requested", index=True)
+    failure_reason = db.Column(db.String(512))
+
+    # Where the money went, frozen at the time of payment, so a later change
+    # to the affiliate's bank details never rewrites what actually happened.
+    bank_account_name = db.Column(db.String(255))
+    bank_account_number = db.Column(db.String(32))
+    bank_name = db.Column(db.String(128))
+    bank_code = db.Column(db.String(16))
+
+    # Paystack's own identifiers, when a transfer was used.
+    provider_reference = db.Column(db.String(64), index=True)
+    provider_status = db.Column(db.String(32))
+
+    note = db.Column(db.String(512))
+
+    requested_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow)
+    paid_at = db.Column(db.DateTime(timezone=True))
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow)
+    updated_at = db.Column(db.DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+    earnings = db.relationship("Earning", back_populates="payout")
+
+    def as_dict(self) -> dict:
+        return {
+            "id": self.reference,
+            "amount": float(self.amount or 0),
+            "currency": self.currency,
+            "method": self.method,
+            "status": self.status,
+            "orderCount": len(self.earnings),
+            "accountName": self.bank_account_name or "",
+            "bankName": self.bank_name or "",
+            # Only the last four digits — enough to recognise the account,
+            # not enough to be worth leaking.
+            "accountNumberLast4": (self.bank_account_number or "")[-4:],
+            "failureReason": self.failure_reason,
+            # Paystack is holding this one until somebody supplies the code
+            # it sent to the account owner.
+            "awaitingOtp": self.status == "awaiting_otp",
+            "providerStatus": self.provider_status,
+            "note": self.note,
+            "requestedAt": self.requested_at.isoformat() if self.requested_at else None,
+            "paidAt": self.paid_at.isoformat() if self.paid_at else None,
         }
 
 
@@ -373,6 +514,27 @@ class Earning(db.Model):
     status = db.Column(db.String(16), nullable=False, default="pending", index=True)
     last_event = db.Column(db.String(32))
 
+    # Campaign commission across this order's lines, summed here so the
+    # money queries do not have to join the lines every time. The markup
+    # stays in `earning`: an affiliate is owed the two added together, and
+    # keeping them apart is what lets either be reported on its own.
+    commission = db.Column(db.Numeric(14, 2), nullable=False, default=0)
+
+    # When a person decided this earning is real — i.e. past the point where
+    # the order is likely to come back. Only approved earnings can be paid.
+    approved_at = db.Column(db.DateTime(timezone=True))
+    # The payout that settled this earning, once one has. This is the audit
+    # trail: every paid earning can name the payment it went out in.
+    payout_id = db.Column(db.Integer, db.ForeignKey("payout.id"), index=True)
+    payout = db.relationship("Payout", back_populates="earnings")
+    # Joined rather than lazy: the transactions table reads this for every
+    # row, and a lazy load there is one query per transaction.
+    link = db.relationship("AffiliateLink", lazy="joined")
+    # The goods on the order. Empty for anything recorded before the store
+    # began reporting them, which is why nothing may assume they exist.
+    lines = db.relationship("EarningLine", back_populates="earning",
+                            cascade="all, delete-orphan", lazy="selectin")
+
     occurred_at = db.Column(db.DateTime(timezone=True))
     created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow)
     updated_at = db.Column(db.DateTime(timezone=True), default=utcnow, onupdate=utcnow)
@@ -385,6 +547,201 @@ class Earning(db.Model):
             "markupPercent": float(self.markup_percent or 0),
             "amountTotal": float(self.amount_total or 0),
             "earning": float(self.earning or 0),
+            "commission": float(self.commission or 0),
+            # What the affiliate is actually owed for this order.
+            "totalDue": float(self.earning or 0) + float(self.commission or 0),
             "status": self.status,
             "occurredAt": self.occurred_at.isoformat() if self.occurred_at else None,
+            "approvedAt": self.approved_at.isoformat() if self.approved_at else None,
+            "payoutRef": self.payout.reference if self.payout else None,
+            # Which link brought this sale in. Deliberately describes the
+            # LINK, not the goods: a product link earns on whatever the
+            # customer ends up buying, so naming the link's product as "the
+            # product sold" would be wrong. The goods are not reported to us
+            # at all yet — the store sends totals only.
+            "sourceCode": self.affiliate_code,
+            "sourceLabel": (self.link.label or None) if self.link else None,
+            "sourceKind": (
+                ("product" if self.link.product_odoo_id else "storewide")
+                if self.link else None
+            ),
+            # Empty for orders recorded before the store started sending the
+            # goods. A reader must treat [] as "not reported", not "nothing
+            # was bought".
+            "lines": [line.as_dict() for line in self.lines],
         }
+
+
+class EarningLine(db.Model):
+    """One product on an attributed order, as the store reported it.
+
+    Separate from `Earning` because an order has many lines and we need to
+    ask questions per product — "what did this campaign pay out on?" — which
+    a blob of JSON on the earning could not answer without scanning
+    everything.
+
+    These rows are a copy of what the store said at the time, not a link to
+    our catalogue: a product can be renamed, repriced or withdrawn later, and
+    the history of what was actually bought must not change with it. The
+    product ids are kept so the rows can still be matched to a campaign.
+    """
+
+    __tablename__ = "earning_line"
+
+    id = db.Column(db.Integer, primary_key=True)
+    earning_id = db.Column(db.Integer, db.ForeignKey("earning.id", ondelete="CASCADE"),
+                           nullable=False, index=True)
+    earning = db.relationship("Earning", back_populates="lines")
+
+    # product.product — the variant, which is what our Product.odoo_id holds
+    # and so what a campaign matches on.
+    product_odoo_id = db.Column(db.Integer, index=True)
+    # product.template — the grouping, for campaigns aimed at a product
+    # rather than one of its variants.
+    product_tmpl_id = db.Column(db.Integer, index=True)
+    name = db.Column(db.String(512))
+
+    quantity = db.Column(db.Numeric(14, 3))
+    unit_price = db.Column(db.Numeric(14, 2))
+    subtotal = db.Column(db.Numeric(14, 2))
+
+    # What a campaign paid on this line, and which campaign paid it. Frozen
+    # at the time of sale: editing or ending the campaign afterwards must not
+    # change what was earned. Null campaign means no campaign covered it.
+    campaign_id = db.Column(db.Integer, db.ForeignKey("campaign.id", ondelete="SET NULL"),
+                            index=True)
+    campaign = db.relationship("Campaign")
+    commission = db.Column(db.Numeric(14, 2), nullable=False, default=0)
+
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow)
+
+    def as_dict(self) -> dict:
+        return {
+            "productId": self.product_odoo_id,
+            "productTmplId": self.product_tmpl_id,
+            "name": self.name or "",
+            "quantity": float(self.quantity or 0),
+            "unitPrice": float(self.unit_price or 0),
+            "subtotal": float(self.subtotal or 0),
+            "commission": float(self.commission or 0),
+            "campaign": self.campaign.name if self.campaign else None,
+        }
+
+
+class Campaign(db.Model):
+    """A standing offer: sell these products, earn this on top of your markup.
+
+    A campaign rewards an affiliate for pushing particular goods. It does not
+    replace the markup — the affiliate still keeps the difference between
+    CyberVilla's price and theirs — it is paid alongside it, out of
+    CyberVilla's margin.
+
+    The terms are frozen onto each earning when a sale happens, not read back
+    from here later, for the same reason the markup is frozen on the order:
+    changing a campaign tomorrow must never rewrite what somebody earned
+    today.
+    """
+
+    __tablename__ = "campaign"
+
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(255), nullable=False)
+    description = db.Column(db.String(1000))
+
+    # "percent" — of the line's subtotal; "fixed" — this much per unit sold.
+    reward_type = db.Column(db.String(16), nullable=False, default="percent")
+    reward_value = db.Column(db.Numeric(14, 2), nullable=False, default=0)
+
+    # Null means open-ended at that end. An order qualifies on the date it
+    # was placed, so ending a campaign never claws back what it already paid.
+    starts_at = db.Column(db.DateTime(timezone=True))
+    ends_at = db.Column(db.DateTime(timezone=True))
+
+    # Switched off by hand, separately from the dates, so a campaign can be
+    # stopped immediately without rewriting its schedule.
+    active = db.Column(db.Boolean, nullable=False, default=True, index=True)
+
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow)
+    updated_at = db.Column(db.DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+    # When affiliates were told about this campaign. Stamped once and never
+    # cleared, so editing a running campaign does not announce it again —
+    # nobody wants the same offer in their bell three times.
+    announced_at = db.Column(db.DateTime(timezone=True))
+
+    products = db.relationship("CampaignProduct", back_populates="campaign",
+                               cascade="all, delete-orphan", lazy="selectin")
+
+    def is_live(self, when=None) -> bool:
+        """Whether this campaign applies to something sold at `when`."""
+        if not self.active:
+            return False
+        moment = when or utcnow()
+        if self.starts_at and moment < self.starts_at:
+            return False
+        if self.ends_at and moment > self.ends_at:
+            return False
+        return True
+
+    def reward_for(self, quantity, subtotal) -> float:
+        """What this campaign pays on one order line."""
+        value = float(self.reward_value or 0)
+        if value <= 0:
+            return 0.0
+        if self.reward_type == "fixed":
+            return round(value * float(quantity or 0), 2)
+        return round(float(subtotal or 0) * value / 100.0, 2)
+
+    def as_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "description": self.description or "",
+            "rewardType": self.reward_type,
+            "rewardValue": float(self.reward_value or 0),
+            "startsAt": self.starts_at.isoformat() if self.starts_at else None,
+            "endsAt": self.ends_at.isoformat() if self.ends_at else None,
+            "active": bool(self.active),
+            "live": self.is_live(),
+            "productCount": len(self.products),
+            "products": [p.as_dict() for p in self.products],
+        }
+
+
+class CampaignProduct(db.Model):
+    """One product a campaign rewards.
+
+    Both ids are kept because the store counts them differently: an order
+    line names a variant, while an admin picking "the Redmi 15C" means the
+    template and all its variants. Matching on either lets a campaign be
+    aimed at whichever the admin meant.
+    """
+
+    __tablename__ = "campaign_product"
+
+    id = db.Column(db.Integer, primary_key=True)
+    campaign_id = db.Column(db.Integer, db.ForeignKey("campaign.id", ondelete="CASCADE"),
+                            nullable=False, index=True)
+    campaign = db.relationship("Campaign", back_populates="products")
+
+    product_odoo_id = db.Column(db.Integer, index=True)
+    product_tmpl_id = db.Column(db.Integer, index=True)
+    name = db.Column(db.String(512))
+
+    def as_dict(self) -> dict:
+        return {
+            "productId": self.product_odoo_id,
+            "productTmplId": self.product_tmpl_id,
+            "name": self.name or "",
+        }
+
+
+def amount_due():
+    """What an affiliate is owed on an earning, as a SQL expression.
+
+    Markup plus campaign commission. Defined once because three separate
+    places total this up — the payable balance, the per-link figures and the
+    admin totals — and a sum that forgot the commission would quietly
+    underpay somebody.
+    """
+    return func.coalesce(Earning.earning, 0) + func.coalesce(Earning.commission, 0)
