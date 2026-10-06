@@ -6,7 +6,6 @@ __pycache__/
 venv/
 
 # Environment / secrets
-.env
 *.pem
 
 # Local databases & scratch
@@ -15,10 +14,11 @@ venv/
 .pytest_cache/
 
 # Editors / OS
-.vscode/
 .idea/
 .DS_Store
 Thumbs.db
 
 # Flask instance folder
 instance/
+config.bat
+node_modules
