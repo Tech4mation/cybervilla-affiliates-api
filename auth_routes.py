@@ -41,12 +41,14 @@ from paystack_client import (
 )
 from payout_service import (
     PayoutError,
+    bank_change_blocked_by,
     confirm_payout_otp,
     fail_payout,
     mark_paid,
     payable_balance,
     reconcile_payout,
     request_payout,
+    retarget_unsent_payouts,
     resend_payout_otp,
     send_payout,
 )
@@ -353,6 +355,10 @@ def affiliate_payout_account_route():
         return jsonify({"error": "not_found", "message": "Affiliate profile missing."}), 404
 
     if request.method == "PUT":
+        blocked = bank_change_blocked_by(affiliate)
+        if blocked:
+            return jsonify({"error": "payout_in_flight", "message": blocked}), 409
+
         body = request.get_json(silent=True) or {}
         number = (body.get("accountNumber") or "").strip()
         code = (body.get("bankCode") or "").strip()
@@ -410,7 +416,13 @@ def affiliate_payout_account_route():
         affiliate.bank_account_number = number
         affiliate.bank_code = code
         affiliate.bank_name = bank_name
+        # A payout already requested but not yet sent must follow the new
+        # account, or the admin would release it to the old one.
+        moved = retarget_unsent_payouts(affiliate)
         db.session.commit()
+        if moved:
+            log.info("Bank change by %s updated %d queued payout(s)",
+                     affiliate.backend_ref, moved)
 
     return jsonify({"account": {
         "accountName": affiliate.bank_account_name or "",

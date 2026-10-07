@@ -210,6 +210,56 @@ def request_payout(affiliate: Affiliate, note: str = "") -> Payout:
     return payout
 
 
+IN_FLIGHT = ("awaiting_otp", "processing")
+
+
+def retarget_unsent_payouts(affiliate) -> int:
+    """Point any not-yet-sent payout at this affiliate's current account.
+
+    A payout freezes the destination when it is requested, which is right
+    for one already sent — the record must say where the money actually
+    went. It is wrong for one still sitting in the queue: if the affiliate
+    has since corrected their account, the admin would otherwise release
+    the money to the account they just replaced.
+
+    Only payouts in "requested" are moved. Once a transfer exists at
+    Paystack the destination is fixed there too, so changing our copy would
+    be a lie; `bank_change_blocked_by` refuses that case instead.
+    """
+    moved = Payout.query.filter(
+        Payout.affiliate_id == affiliate.id,
+        Payout.status == "requested",
+    ).all()
+    for payout in moved:
+        payout.bank_account_name = affiliate.bank_account_name
+        payout.bank_account_number = affiliate.bank_account_number
+        payout.bank_name = affiliate.bank_name
+        payout.bank_code = affiliate.bank_code
+    if moved:
+        log.info("Repointed %d unsent payout(s) for %s at the new account",
+                 len(moved), affiliate.backend_ref)
+    return len(moved)
+
+
+def bank_change_blocked_by(affiliate) -> str | None:
+    """Why this affiliate cannot change their bank account right now.
+
+    Once a transfer is with Paystack the destination is settled there and
+    we cannot move it. Accepting a change would leave our record disagreeing
+    with where the money is actually going.
+    """
+    in_flight = Payout.query.filter(
+        Payout.affiliate_id == affiliate.id,
+        Payout.status.in_(IN_FLIGHT),
+    ).first()
+    if in_flight:
+        return (
+            f"Payout {in_flight.reference} is already being sent, so the account it "
+            "goes to cannot be changed now. Wait until it completes or fails."
+        )
+    return None
+
+
 def mark_paid(payout: Payout, provider_reference: str = "", note: str = "") -> Payout:
     """Record that this payout has actually been sent.
 
@@ -412,17 +462,19 @@ def send_payout(payout: Payout) -> Payout:
             "to add their bank details first."
         )
 
-    affiliate = payout.affiliate
-    recipient = affiliate.paystack_recipient_code if affiliate else None
-    if not recipient:
-        try:
-            recipient = create_recipient(
-                payout.bank_account_name, payout.bank_account_number, payout.bank_code,
-            )["code"]
-        except PaystackError as exc:
-            raise PayoutError(f"Paystack would not accept those bank details: {exc}") from exc
-        affiliate.paystack_recipient_code = recipient
-        db.session.commit()
+    # The destination comes from the payout's own frozen details, never from
+    # the affiliate's current record. Those two can differ — an affiliate may
+    # change their bank account after requesting — and if the destination
+    # were read from the affiliate while the admin screen showed the payout,
+    # somebody would approve one account and pay another. Paystack returns
+    # the same recipient for the same account, so asking every time costs a
+    # round trip and buys the guarantee that what is shown is what is paid.
+    try:
+        recipient = create_recipient(
+            payout.bank_account_name, payout.bank_account_number, payout.bank_code,
+        )["code"]
+    except PaystackError as exc:
+        raise PayoutError(f"Paystack would not accept those bank details: {exc}") from exc
 
     payout.method = "paystack"
     try:
