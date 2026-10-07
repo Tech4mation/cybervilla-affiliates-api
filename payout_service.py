@@ -418,7 +418,7 @@ def send_payout(payout: Payout) -> Payout:
         try:
             recipient = create_recipient(
                 payout.bank_account_name, payout.bank_account_number, payout.bank_code,
-            )
+            )["code"]
         except PaystackError as exc:
             raise PayoutError(f"Paystack would not accept those bank details: {exc}") from exc
         affiliate.paystack_recipient_code = recipient
