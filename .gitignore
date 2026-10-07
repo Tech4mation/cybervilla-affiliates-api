@@ -6,6 +6,11 @@ __pycache__/
 venv/
 
 # Environment / secrets
+# These patterns were lost at some point and .env became committable on a
+# public repo. The server's .env holds the Paystack secret key.
+.env
+.env.*
+!.env.example
 *.pem
 
 # Local databases & scratch
