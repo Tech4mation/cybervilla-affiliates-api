@@ -20,7 +20,7 @@ recording cannot send at all.
 import logging
 from datetime import timedelta
 
-from sqlalchemy import func
+from sqlalchemy import func, or_
 
 from config import Config
 from models import Affiliate, Earning, Payout, amount_due, db, utcnow
@@ -45,50 +45,60 @@ class PayoutError(Exception):
 # Approving earnings
 # --------------------------------------------------------------------------- #
 
-def approvable_earnings(affiliate_id: int | None = None):
-    """Pending earnings old enough that the order is unlikely to come back."""
+def payable_conditions(affiliate_id: int | None = None) -> list:
+    """What makes an earning payable, as filter conditions.
+
+    Shared by the balance and by the payout that claims it, so the figure an
+    affiliate is shown and the earnings actually taken can never disagree.
+
+    There is no approval step. An order the store has confirmed as paid is
+    money owed; a person vets it once, at the point the payout is released,
+    which is the step that actually moves anything.
+
+    The waiting period lives here instead. It used to gate approval, and
+    with approval gone it has to gate payment or it would quietly stop
+    protecting anything: a refund is only harmless while we still hold the
+    money.
+    """
+    conditions = [
+        Earning.status == "completed",
+        Earning.payout_id.is_(None),
+    ]
+    if affiliate_id is not None:
+        conditions.append(Earning.affiliate_id == affiliate_id)
+    if Config.EARNING_HOLD_DAYS > 0:
+        cutoff = utcnow() - timedelta(days=Config.EARNING_HOLD_DAYS)
+        # An earning with no date cannot be shown to be past the window, so
+        # it waits rather than ageing in by default.
+        conditions.append(Earning.occurred_at.isnot(None))
+        conditions.append(Earning.occurred_at <= cutoff)
+    return conditions
+
+
+def held_back_total(affiliate_id: int) -> float:
+    """Money earned but still inside the waiting period.
+
+    Only so the dashboard can say "this is coming" rather than leaving the
+    affiliate to wonder where it went.
+    """
+    if Config.EARNING_HOLD_DAYS <= 0:
+        return 0.0
     cutoff = utcnow() - timedelta(days=Config.EARNING_HOLD_DAYS)
-    query = Earning.query.filter(
-        Earning.status == "pending",
-        # An earning with no date cannot be shown to be past the hold, so it
-        # waits for someone to look at it rather than ageing in automatically.
-        Earning.occurred_at.isnot(None),
-        Earning.occurred_at <= cutoff,
-    )
-    if affiliate_id:
-        query = query.filter(Earning.affiliate_id == affiliate_id)
-    return query.order_by(Earning.occurred_at.asc()).all()
-
-
-def approve_earnings(earnings) -> int:
-    """Mark earnings as genuinely owed. Reversed ones are never approved."""
-    now = utcnow()
-    count = 0
-    per_affiliate: dict[int, int] = {}
-    for earning in earnings:
-        if earning.status != "pending":
-            continue
-        earning.status = "approved"
-        earning.approved_at = now
-        per_affiliate[earning.affiliate_id] = per_affiliate.get(earning.affiliate_id, 0) + 1
-        count += 1
-    db.session.commit()
-    for affiliate_id, n in per_affiliate.items():
-        notify_affiliate(
-            affiliate_id, "earning.approved",
-            f"{n} earning{'' if n == 1 else 's'} approved",
-            "This money is now ready to be paid out.",
-            "/earnings",
+    total = (
+        db.session.query(func.coalesce(func.sum(amount_due()), 0))
+        .filter(
+            Earning.affiliate_id == affiliate_id,
+            Earning.status == "completed",
+            Earning.payout_id.is_(None),
+            or_(Earning.occurred_at.is_(None), Earning.occurred_at > cutoff),
         )
-    return count
+        .scalar()
+    )
+    return float(total or 0)
 
-
-# --------------------------------------------------------------------------- #
-# What is owed
-# --------------------------------------------------------------------------- #
 
 def payable_balance(affiliate_id: int) -> dict:
-    """Approved earnings not yet attached to a payout, and whether they can go.
+    """What this affiliate can be paid now, and if not, why not.
 
     Returned as a summary rather than a number because the dashboard has to
     explain *why* a payout cannot be requested, not merely refuse.
@@ -99,11 +109,7 @@ def payable_balance(affiliate_id: int) -> dict:
             func.coalesce(func.sum(amount_due()), 0),
             func.max(Earning.currency),
         )
-        .filter(
-            Earning.affiliate_id == affiliate_id,
-            Earning.status == "approved",
-            Earning.payout_id.is_(None),
-        )
+        .filter(*payable_conditions(affiliate_id))
         .one()
     )
     count, total, currency = int(rows[0] or 0), float(rows[1] or 0), rows[2]
@@ -121,11 +127,25 @@ def payable_balance(affiliate_id: int) -> dict:
         Payout.status.in_(["requested", "approved", "processing"]),
     ).first()
 
+    waiting = held_back_total(affiliate_id)
+
     reasons = []
     if not count:
-        reasons.append("You have no approved earnings yet.")
-    if total < Config.MIN_PAYOUT_AMOUNT:
-        reasons.append(f"The minimum payout is {Config.MIN_PAYOUT_AMOUNT:,.0f}.")
+        # Said as one sentence when the money exists but is waiting, because
+        # "you have nothing" and "the minimum is 50,000" shown together read
+        # as a contradiction to somebody looking at their earnings.
+        if waiting:
+            reasons.append(
+                f"{waiting:,.0f} is still within the {Config.EARNING_HOLD_DAYS}-day "
+                "waiting period after a sale."
+            )
+        else:
+            reasons.append("You have no completed earnings yet.")
+    elif total < Config.MIN_PAYOUT_AMOUNT:
+        reasons.append(
+            f"The minimum payout is {Config.MIN_PAYOUT_AMOUNT:,.0f} and you have "
+            f"{total:,.0f} ready."
+        )
     if not has_bank:
         reasons.append("Add the bank account your payout should go to.")
     if pending_payout:
@@ -136,6 +156,8 @@ def payable_balance(affiliate_id: int) -> dict:
         "orderCount": count,
         "currency": currency,
         "minimum": float(Config.MIN_PAYOUT_AMOUNT),
+        "waiting": waiting,
+        "holdDays": int(Config.EARNING_HOLD_DAYS),
         "canRequest": not reasons,
         "blockedBy": reasons,
     }
@@ -156,11 +178,7 @@ def request_payout(affiliate: Affiliate, note: str = "") -> Payout:
     if not summary["canRequest"]:
         raise PayoutError(" ".join(summary["blockedBy"]))
 
-    earnings = Earning.query.filter(
-        Earning.affiliate_id == affiliate.id,
-        Earning.status == "approved",
-        Earning.payout_id.is_(None),
-    ).all()
+    earnings = Earning.query.filter(*payable_conditions(affiliate.id)).all()
 
     payout = Payout(
         affiliate_id=affiliate.id,
@@ -228,8 +246,8 @@ def mark_paid(payout: Payout, provider_reference: str = "", note: str = "") -> P
 def fail_payout(payout: Payout, reason: str) -> Payout:
     """Record that a payout did not go through, and free its earnings.
 
-    The earnings go back to approved and unattached so they can be paid in a
-    later attempt; the failed payout stays, so the attempt is not lost.
+    The earnings go back to unattached so they can be paid in a later
+    attempt; the failed payout stays, so the attempt is not lost.
     """
     if payout.status == "paid":
         raise PayoutError("A payout that has been paid cannot be marked failed.")
@@ -482,7 +500,7 @@ def reverse_payout(payout: Payout, reason: str) -> Payout:
     payout.paid_at = None
     payout.failure_reason = (reason or "").strip()[:512] or "The transfer was reversed."
     for earning in earnings:
-        earning.status = "approved"
+        earning.status = "completed"
         earning.payout_id = None
     db.session.commit()
     log.warning("Payout %s was REVERSED after being paid: %s (%d earnings returned)",
