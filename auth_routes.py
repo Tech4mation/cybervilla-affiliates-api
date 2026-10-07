@@ -35,6 +35,7 @@ from notification_service import unread_count
 from paystack_client import (
     PaystackError,
     PaystackNotConfigured,
+    create_recipient,
     list_banks,
     resolve_account,
 )
@@ -366,12 +367,21 @@ def affiliate_payout_account_route():
                 "message": "An account number should be 8 to 20 digits.",
             }), 400
 
-        # The bank's own record decides whose name is on the account. A name
-        # sent by the browser is a claim, not a fact, and storing it would
-        # let somebody label an account as anyone they liked — then point at
-        # that label when the money went to the wrong place.
+        # Registering the destination with Paystack *is* the check. A plain
+        # lookup is not enough: some accounts resolve and still cannot
+        # receive a transfer, which used to surface only when a payout was
+        # sent and failed with "Cannot resolve account" — long after the
+        # affiliate had been told their details were saved.
+        #
+        # It also settles whose name is on the account. A name sent by the
+        # browser is a claim, not a fact, and storing it would let somebody
+        # label an account as anyone they liked, then point at that label
+        # when the money went to the wrong place.
         try:
-            resolved_name = resolve_account(number, code)
+            registered = create_recipient(
+                (body.get("accountName") or "").strip() or "Affiliate", number, code,
+            )
+            resolved_name = registered["account_name"]
             bank_name = next((b["name"] for b in list_banks() if b["code"] == code), "")
         except PaystackNotConfigured as exc:
             log.warning("payout account not verifiable: %s", exc)
@@ -380,7 +390,10 @@ def affiliate_payout_account_route():
                 "message": "We can't check bank details just now, so we haven't saved them.",
             }), 503
         except PaystackError as exc:
-            return jsonify({"error": "unresolved", "message": str(exc)}), 400
+            return jsonify({
+                "error": "unresolved",
+                "message": f"{exc} Check the account number and bank, and try again.",
+            }), 400
 
         if not bank_name:
             return jsonify({
@@ -391,8 +404,7 @@ def affiliate_payout_account_route():
         # Pointing at a different account makes the recipient Paystack already
         # holds for the old one wrong. Left in place it would quietly send the
         # next payout to the account this change was meant to replace.
-        if affiliate.bank_account_number != number or affiliate.bank_code != code:
-            affiliate.paystack_recipient_code = None
+        affiliate.paystack_recipient_code = registered["code"]
 
         affiliate.bank_account_name = resolved_name
         affiliate.bank_account_number = number

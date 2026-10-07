@@ -157,20 +157,6 @@ def list_banks(country: str = "nigeria", refresh: bool = False) -> list[dict]:
     banks = [{"code": code, "name": name} for code, name in by_code.items()]
     banks.sort(key=lambda row: row["name"].lower())
 
-    # Paystack's test mode honours a magic bank code, 001, against which any
-    # well-formed account number resolves, and which is exempt from the three
-    # real lookups a day that otherwise make this form impossible to test.
-    # It is not in Paystack's own list, so it is added here — and only while
-    # the key is a test key, so it can never appear on a live payout form.
-    #
-    # Named for exactly what it is: it resolves, but a transfer recipient
-    # cannot be created against it, so it exercises the form and not the
-    # sending. Saying so here is the only place a tester would see it.
-    if not Config.paystack_is_live():
-        banks.insert(0, {
-            "code": "001",
-            "name": "Test Bank (test mode only — lookups work, payouts do not)",
-        })
     _BANKS_CACHE["rows"] = banks
     _BANKS_CACHE["fetched_at"] = time.time()
     return banks
@@ -198,12 +184,18 @@ def resolve_account(account_number: str, bank_code: str) -> str:
 # Recipients and transfers
 # --------------------------------------------------------------------------- #
 
-def create_recipient(name: str, account_number: str, bank_code: str) -> str:
-    """Register where money may be sent, and return the recipient code.
+def create_recipient(name: str, account_number: str, bank_code: str) -> dict:
+    """Register where money may be sent. Returns {code, account_name}.
+
+    This is the real test of whether an account can be paid — stricter than
+    `resolve_account`, which answers for some accounts that cannot actually
+    receive a transfer (the test-mode bank code 001 being the obvious one).
+    So it doubles as validation: if this refuses, the account is not a
+    payout destination, whatever a lookup said.
 
     Paystack treats repeat registrations of the same account as the same
-    recipient, so calling this twice is safe; we still store the code to save
-    the round trip.
+    recipient, so calling this twice is safe; we still store the code to
+    save the round trip.
     """
     data = _request("POST", "/transferrecipient", {
         "type": "nuban",
@@ -215,7 +207,10 @@ def create_recipient(name: str, account_number: str, bank_code: str) -> str:
     code = (data.get("recipient_code") or "").strip()
     if not code:
         raise PaystackError("Paystack did not return a recipient code.")
-    return code
+    # The bank's own name for the account, which is what should be stored —
+    # it comes back here, so no second lookup is needed.
+    resolved = ((data.get("details") or {}).get("account_name") or "").strip()
+    return {"code": code, "account_name": resolved or name}
 
 
 def initiate_transfer(amount_naira, recipient_code: str, reason: str, reference: str) -> dict:
