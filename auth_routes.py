@@ -40,8 +40,6 @@ from paystack_client import (
 )
 from payout_service import (
     PayoutError,
-    approvable_earnings,
-    approve_earnings,
     confirm_payout_otp,
     fail_payout,
     mark_paid,
@@ -582,31 +580,6 @@ def admin_list_earnings():
             for state, count, amount in sums
         },
     }), 200
-
-
-@auth_bp.route("/admin/earnings/approvable", methods=["GET"])
-@require_admin
-def admin_approvable_earnings_route():
-    """Earnings old enough to be treated as genuinely owed."""
-    rows = approvable_earnings()
-    return jsonify({
-        "earnings": [r.as_dict() for r in rows],
-        "holdDays": Config.EARNING_HOLD_DAYS,
-    }), 200
-
-
-@auth_bp.route("/admin/earnings/approve", methods=["POST"])
-@require_admin
-def admin_approve_earnings_route():
-    """Approve specific earnings, or every one that is past the hold."""
-    body = request.get_json(silent=True) or {}
-    refs = body.get("orderRefs")
-    if refs:
-        rows = Earning.query.filter(Earning.odoo_order_ref.in_(refs),
-                                    Earning.status == "pending").all()
-    else:
-        rows = approvable_earnings()
-    return jsonify({"approved": approve_earnings(rows)}), 200
 
 
 @auth_bp.route("/admin/payouts", methods=["GET"])

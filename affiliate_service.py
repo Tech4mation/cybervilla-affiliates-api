@@ -346,7 +346,7 @@ def record_order_event(payload: dict) -> Earning:
     creating = earning is None
     was_reversed = bool(earning and earning.status == "reversed")
     if creating:
-        earning = Earning(odoo_order_ref=order_ref, status="pending")
+        earning = Earning(odoo_order_ref=order_ref, status="completed")
         db.session.add(earning)
 
     # Attribution and amounts, refreshed from the payload every time.
@@ -385,7 +385,10 @@ def record_order_event(payload: dict) -> Earning:
         was_reversed = earning.status == "reversed"
         earning.status = "reversed"
     elif creating:
-        earning.status = "pending"
+        # The store only tells us about an order once the customer has paid,
+        # so it is money owed from the moment it arrives. There is no review
+        # step; a person vets it when the payout is released.
+        earning.status = "completed"
 
     db.session.commit()
 
