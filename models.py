@@ -319,7 +319,8 @@ class AffiliateLink(db.Model):
 
     def url(self) -> str:
         from config import Config
-        store_url = Config.ODOO_URL.rstrip("/") if Config.ODOO_URL else "https://cybervilla.io"
+        base = Config.STORE_PUBLIC_URL or Config.ODOO_URL
+        store_url = base.rstrip("/") if base else "https://cybervilla.io"
         return f"{store_url}/r/{self.code}"
 
     def product_name(self) -> str | None:

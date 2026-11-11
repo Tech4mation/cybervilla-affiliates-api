@@ -36,6 +36,10 @@ class Config:
     ODOO_DATABASE = (os.getenv("ODOO_DATABASE") or "").strip()
     ODOO_USERNAME = (os.getenv("ODOO_USERNAME") or "").strip()
     ODOO_API_KEY = (os.getenv("ODOO_API_KEY") or "").strip()
+    # The store's address as a buyer reaches it, used to build the links
+    # affiliates share. Usually the same as ODOO_URL and left unset; it
+    # differs when this service talks to the store over a private network.
+    STORE_PUBLIC_URL = (os.getenv("STORE_PUBLIC_URL") or "").strip()
 
     CATALOGUE_TTL_MINUTES = _int("CATALOGUE_TTL_MINUTES", 60)
 
