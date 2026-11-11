@@ -84,6 +84,12 @@ def apply_to_earning(earning) -> float:
         when = earning.occurred_at
         pool = live_campaigns(when)
         for line in earning.lines:
+            # Never pay a campaign on the shipping charge, even if an admin
+            # once put the delivery product on one.
+            if line.is_delivery:
+                line.commission = 0
+                line.campaign_id = None
+                continue
             amount, campaign = best_reward(
                 line.product_odoo_id, line.product_tmpl_id,
                 line.quantity, line.subtotal, when, pool,
