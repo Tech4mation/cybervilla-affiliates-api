@@ -19,6 +19,7 @@ from the store, because only the store knows when the money actually landed.
 from datetime import datetime, timedelta, timezone
 
 from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import false as sa_false
 from sqlalchemy import func
 from werkzeug.security import check_password_hash, generate_password_hash
 
@@ -613,6 +614,12 @@ class EarningLine(db.Model):
     campaign = db.relationship("Campaign")
     commission = db.Column(db.Numeric(14, 2), nullable=False, default=0)
 
+    # The store's shipping charge is an ordinary product line. Flagged so
+    # nothing that pays a share of "the order" ever pays it on delivery.
+    # False for lines reported before the store began sending the flag.
+    is_delivery = db.Column(db.Boolean, nullable=False, default=False,
+                            server_default=sa_false())
+
     created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow)
 
     def as_dict(self) -> dict:
@@ -625,6 +632,7 @@ class EarningLine(db.Model):
             "subtotal": float(self.subtotal or 0),
             "commission": float(self.commission or 0),
             "campaign": self.campaign.name if self.campaign else None,
+            "isDelivery": bool(self.is_delivery),
         }
 
 

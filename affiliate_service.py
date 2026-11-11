@@ -168,6 +168,10 @@ def _push_link(link: AffiliateLink) -> bool:
         # a product.template. Translate, and if that fails send nothing rather
         # than an id from the wrong table — which would quietly land the
         # customer on an unrelated product instead of erroring.
+        # Always sent, even when empty: leaving it out would keep whatever
+        # product the store last had for this link, which after a store move
+        # can be an unrelated product under the same number.
+        vals["product_tmpl_id"] = False
         if link.product_odoo_id:
             template_id = client.template_id_for(link.product_odoo_id)
             if template_id:
@@ -269,7 +273,11 @@ def resync_pending() -> dict:
         else:
             db.session.rollback()
             failed += 1
-    for link in AffiliateLink.query.filter(AffiliateLink.odoo_link_id.is_(None)).all():
+    # Retired links are left alone: pushing one would switch it back on in
+    # the store, where its code would start pricing baskets again.
+    for link in AffiliateLink.query.filter(
+        AffiliateLink.odoo_link_id.is_(None), AffiliateLink.active.is_(True),
+    ).all():
         if _push_link(link):
             pushed_links += 1
             db.session.commit()
@@ -316,6 +324,7 @@ def _replace_lines(earning: Earning, lines) -> None:
                 quantity=row.get("quantity"),
                 unit_price=row.get("price_unit"),
                 subtotal=row.get("price_subtotal"),
+                is_delivery=bool(row.get("is_delivery")),
             ))
     except Exception:  # noqa: BLE001 — detail is never worth losing the earning
         log.warning("Could not record order lines for %s; keeping the earning",

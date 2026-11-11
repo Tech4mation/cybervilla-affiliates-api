@@ -123,6 +123,25 @@ def _register_commands(app: Flask) -> None:
         admin = ensure_admin_account(email=email, password=password, name=name)
         click.echo(f"Admin account ready: {admin.email} (ID: {admin.id}, Name: {admin.name})")
 
+    @app.cli.command("switch-store")
+    @click.option("--yes", is_flag=True,
+                  help="Required. Confirms a database backup was taken first.")
+    def switch_store_command(yes):
+        """Move onto the store in ODOO_URL, starting earnings from zero.
+
+        Removes every earning and payout, then re-pushes affiliates and links
+        and re-copies the catalogue. See store_switch.py. Back up first.
+        """
+        if not yes:
+            raise click.UsageError("Back up the database, then re-run with --yes.")
+        from config import Config
+        from store_switch import switch_store
+
+        click.echo(f"Switching to {Config.ODOO_URL} (database {Config.ODOO_DATABASE})")
+        report = switch_store(echo=click.echo)
+        if report["needs_attention"]:
+            raise SystemExit(1)
+
     @app.cli.command("sync-catalogue")
     @click.option("--batch-size", default=200, show_default=True,
                   help="How many products to read from the store per call.")
