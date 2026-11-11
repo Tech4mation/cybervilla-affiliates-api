@@ -32,6 +32,8 @@ from models import (
 )
 from campaign_service import announce_live_campaigns, live_campaigns, rewards_by_product
 from notification_service import unread_count
+from referral_service import ensure_code, first_name, inviter_for_code
+from referral_service import summary as referral_summary
 from paystack_client import (
     PaystackError,
     PaystackNotConfigured,
@@ -57,6 +59,13 @@ log = logging.getLogger(__name__)
 
 auth_bp = Blueprint("auth", __name__)
 
+
+def _person(affiliate) -> dict:
+    """An affiliate as the admin screens link to them (by user id)."""
+    user = getattr(affiliate, "user", None)
+    return {"userId": user.id if user else None, "affiliateId": affiliate.backend_ref,
+            "name": affiliate.name}
+
 # How many earning rows an admin screen is handed at once. The money totals are
 # summed in the database and are not affected by this.
 EARNINGS_PAGE_LIMIT = 500
@@ -77,6 +86,7 @@ def signup_route():
             password=body.get("password", ""),
             phone=body.get("phone", ""),
             why_join=body.get("whyJoin") or body.get("why_join") or body.get("pitch", ""),
+            referral_code=body.get("referralCode") or body.get("ref") or "",
         )
     except ValueError as exc:
         return jsonify({"error": "bad_request", "message": str(exc)}), 400
@@ -98,6 +108,20 @@ def signup_route():
     # Set cookie for browser sessions
     res.set_cookie("affiliate_token", token, httponly=False, samesite="Lax")
     return res
+
+
+@auth_bp.route("/auth/referral/<code>", methods=["GET"])
+def referral_code_route(code: str):
+    """Is this invite code real, and whose is it? Public, for the sign-up page.
+
+    Gives away only the inviter's first name — enough for "Invited by Ada",
+    which is what the person holding the code was told anyway.
+    """
+    inviter = inviter_for_code(code)
+    if not inviter:
+        return jsonify({"valid": False}), 200
+    return jsonify({"valid": True, "code": inviter.referral_code,
+                    "inviter": first_name(inviter.name)}), 200
 
 
 @auth_bp.route("/auth/signin", methods=["POST"])
@@ -463,6 +487,20 @@ def request_payout_route():
     return jsonify({"payout": payout.as_dict()}), 201
 
 
+@auth_bp.route("/affiliate/referrals", methods=["GET"])
+@require_approved_affiliate
+def affiliate_referrals_route():
+    """The invite page: my code, the rate, and everyone I brought in."""
+    user: User = g.current_user
+    if not user.affiliate:
+        return jsonify({"error": "not_found", "message": "No affiliate profile."}), 404
+    had_code = bool(user.affiliate.referral_code)
+    ensure_code(user.affiliate)
+    if not had_code:
+        db.session.commit()
+    return jsonify(referral_summary(user.affiliate)), 200
+
+
 @auth_bp.route("/affiliate/earnings", methods=["GET"])
 @require_approved_affiliate
 def list_affiliate_earnings_route():
@@ -515,6 +553,8 @@ def admin_list_affiliates():
             "odooAffiliateId": aff.odoo_affiliate_id if aff else None,
             "synced": (aff.odoo_affiliate_id is not None) if aff else False,
             "joinedAt": u.created_at.isoformat() if u.created_at else None,
+            "invitedBy": _person(aff.referred_by) if aff and aff.referred_by else None,
+            "recruitCount": len(aff.recruits) if aff else 0,
         })
 
     pending_count = User.query.filter_by(role="affiliate", status="pending").count()
@@ -587,7 +627,8 @@ def admin_list_earnings():
     sums = (
         db.session.query(
             Earning.status,
-            func.count(Earning.id),
+            # Orders: a referral bonus is money, not another sale.
+            func.count(Earning.id).filter(Earning.kind == "sale"),
             func.coalesce(func.sum(amount_due()), 0),
         )
         .group_by(Earning.status)
@@ -740,7 +781,10 @@ def admin_affiliate_detail(target_id: int):
             "odooAffiliateId": affiliate.odoo_affiliate_id if affiliate else None,
             "synced": bool(affiliate and affiliate.odoo_affiliate_id),
             "joinedAt": user.created_at.isoformat() if user.created_at else None,
+            "referralCode": affiliate.referral_code if affiliate else None,
+            "invitedBy": _person(affiliate.referred_by) if affiliate and affiliate.referred_by else None,
         },
+        "referrals": referral_summary(affiliate) if affiliate else None,
         "links": [link.as_dict() for link in (affiliate.links if affiliate else [])],
         "earnings": [row.as_dict() for row in Earning.query.filter_by(
             affiliate_id=affiliate.id if affiliate else None

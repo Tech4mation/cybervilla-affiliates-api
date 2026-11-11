@@ -30,6 +30,7 @@ from models import (
 )
 from campaign_service import apply_to_earning
 from notification_service import notify_affiliate
+from referral_service import first_name, record_bonus, reverse_bonus
 
 log = logging.getLogger(__name__)
 
@@ -399,7 +400,33 @@ def record_order_event(payload: dict) -> Earning:
         # step; a person vets it when the payout is released.
         earning.status = "completed"
 
+    # The inviter's referral bonus rides on the same event: taken back with
+    # a cancellation, added (once, frozen) with a payment.
+    bonus_reversed = bonus_created = None
+    if event == "order.cancelled":
+        bonus_reversed = reverse_bonus(earning)
+    else:
+        bonus_row, created = record_bonus(earning)
+        bonus_created = bonus_row if created else None
+
     db.session.commit()
+
+    if bonus_created:
+        recruit_name = first_name(getattr(db.session.get(Affiliate, earning.affiliate_id), "name", ""))
+        notify_affiliate(
+            bonus_created.affiliate_id, "referral.earned",
+            f"You earned {bonus_created.bonus} from {recruit_name}'s sale",
+            f"{recruit_name}, who joined with your invite, made a sale (order {order_ref}).",
+            "/invite",
+        )
+    if bonus_reversed:
+        notify_affiliate(
+            bonus_reversed.affiliate_id, "referral.reversed",
+            "A referral bonus was taken back",
+            f"Order {order_ref} was cancelled or refunded, so the {bonus_reversed.bonus} "
+            "bonus on it has been removed from your balance.",
+            "/invite",
+        )
 
     # Told after the fact, and only when something actually changed, so a
     # retried delivery of the same event does not notify twice.

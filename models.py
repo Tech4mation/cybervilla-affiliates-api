@@ -183,6 +183,15 @@ class Affiliate(db.Model):
     bank_account_name = db.Column(db.String(255))
     paystack_recipient_code = db.Column(db.String(64))
 
+    # This affiliate's own invite code, for bringing other marketers in.
+    # Given out on approval (or the first time they open the invite page),
+    # and never changed: people have already been sent it.
+    referral_code = db.Column(db.String(32), unique=True, index=True)
+    # Who invited them, fixed at sign-up and never edited afterwards. One
+    # level only: an inviter's own inviter earns nothing from this person.
+    referred_by_id = db.Column(db.Integer, db.ForeignKey("affiliate.id"), index=True)
+    referred_by = db.relationship("Affiliate", remote_side=[id], backref="recruits")
+
     # The store's id for our copy of this affiliate, returned by the push.
     odoo_affiliate_id = db.Column(db.Integer, index=True)
     synced_at = db.Column(db.DateTime(timezone=True))
@@ -522,6 +531,22 @@ class Earning(db.Model):
     # keeping them apart is what lets either be reported on its own.
     commission = db.Column(db.Numeric(14, 2), nullable=False, default=0)
 
+    # "sale": this affiliate's own order. "referral": a bonus this affiliate
+    # earned because someone they invited made the sale in `source_earning`.
+    # A bonus is a row of its own so it is held, paid, reversed and audited
+    # exactly like any other money owed — no second ledger to keep in step.
+    # Anything that counts *orders* must count "sale" rows only.
+    kind = db.Column(db.String(16), nullable=False, default="sale",
+                     server_default="sale", index=True)
+    source_earning_id = db.Column(
+        db.Integer, db.ForeignKey("earning.id", ondelete="SET NULL"), index=True,
+    )
+    source_earning = db.relationship("Earning", remote_side=[id])
+    # The bonus itself and the rate it was worked out at, both frozen when
+    # the sale was recorded. Zero on every sale row.
+    bonus = db.Column(db.Numeric(14, 2), nullable=False, default=0, server_default="0")
+    bonus_percent = db.Column(db.Numeric(5, 2))
+
     # When a person decided this earning is real — i.e. past the point where
     # the order is likely to come back. Only approved earnings can be paid.
     approved_at = db.Column(db.DateTime(timezone=True))
@@ -550,8 +575,18 @@ class Earning(db.Model):
             "amountTotal": float(self.amount_total or 0),
             "earning": float(self.earning or 0),
             "commission": float(self.commission or 0),
-            # What the affiliate is actually owed for this order.
-            "totalDue": float(self.earning or 0) + float(self.commission or 0),
+            "bonus": float(self.bonus or 0),
+            "bonusPercent": float(self.bonus_percent) if self.bonus_percent is not None else None,
+            "kind": self.kind or "sale",
+            # For a referral bonus: who made the sale. Only their name — never
+            # what they themselves earned on it.
+            "fromAffiliate": (
+                self.source_earning.affiliate.name
+                if self.kind == "referral" and self.source_earning and self.source_earning.affiliate
+                else None
+            ),
+            # What the affiliate is actually owed for this row.
+            "totalDue": float(self.earning or 0) + float(self.commission or 0) + float(self.bonus or 0),
             "status": self.status,
             "occurredAt": self.occurred_at.isoformat() if self.occurred_at else None,
             "approvedAt": self.approved_at.isoformat() if self.approved_at else None,
@@ -569,9 +604,14 @@ class Earning(db.Model):
             ),
             # Empty for orders recorded before the store started sending the
             # goods. A reader must treat [] as "not reported", not "nothing
-            # was bought".
+            # was bought". A bonus row has none of its own: the goods belong
+            # to the recruit's customer, not the inviter's.
             "lines": [line.as_dict() for line in self.lines],
         }
+
+    @property
+    def affiliate(self):
+        return db.session.get(Affiliate, self.affiliate_id) if self.affiliate_id else None
 
 
 class EarningLine(db.Model):
@@ -748,9 +788,11 @@ class CampaignProduct(db.Model):
 def amount_due():
     """What an affiliate is owed on an earning, as a SQL expression.
 
-    Markup plus campaign commission. Defined once because three separate
-    places total this up — the payable balance, the per-link figures and the
-    admin totals — and a sum that forgot the commission would quietly
-    underpay somebody.
+    Markup plus campaign commission plus referral bonus. Defined once because
+    several places total this up — the payable balance, the per-link figures
+    and the admin totals — and a sum that forgot any part would quietly
+    underpay somebody. (A sale row has no bonus; a bonus row has no markup
+    or commission; adding all three is right for both.)
     """
-    return func.coalesce(Earning.earning, 0) + func.coalesce(Earning.commission, 0)
+    return (func.coalesce(Earning.earning, 0) + func.coalesce(Earning.commission, 0)
+            + func.coalesce(Earning.bonus, 0))
