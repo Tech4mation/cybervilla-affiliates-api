@@ -21,6 +21,14 @@ def _int(name: str, default: int) -> int:
         return default
 
 
+def _float(name: str, default: float) -> float:
+    raw = (os.getenv(name) or "").strip()
+    try:
+        return float(raw) if raw else default
+    except ValueError:
+        return default
+
+
 class Config:
     # --- Database ---------------------------------------------------------
     # Any SQLAlchemy URL is accepted so a throwaway SQLite file can be used for
@@ -75,6 +83,14 @@ class Config:
     # still be cancelled or refunded inside this window, and money already
     # paid out is far harder to recover than money not yet sent.
     EARNING_HOLD_DAYS = _int("EARNING_HOLD_DAYS", 5)
+
+    # --- Referrals -----------------------------------------------------------
+    # What an inviter earns on each completed order by someone they invited,
+    # as a percentage of the order's goods before tax (delivery left out).
+    # Paid by CyberVilla on top; the recruit's own earnings are untouched.
+    # Each bonus keeps the rate it was earned at, so changing this only
+    # affects orders from then on.
+    REFERRAL_BONUS_PERCENT = _float("REFERRAL_BONUS_PERCENT", 1.0)
 
     # --- Paystack (sending money) ----------------------------------------
     # The key prefix is the only thing that separates a simulated transfer

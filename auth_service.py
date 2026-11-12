@@ -21,7 +21,8 @@ from werkzeug.security import check_password_hash, generate_password_hash
 
 from affiliate_service import _push_affiliate
 from config import Config
-from notification_service import notify, notify_admins
+from notification_service import notify, notify_admins, notify_affiliate
+from referral_service import ensure_code, first_name, inviter_for_code
 from models import Affiliate, User, db, utcnow
 
 log = logging.getLogger(__name__)
@@ -183,6 +184,7 @@ def signup_affiliate(
     password: str,
     phone: str = "",
     why_join: str = "",
+    referral_code: str = "",
 ) -> Tuple[User, Affiliate]:
     """Register a new affiliate applicant.
     
@@ -209,12 +211,25 @@ def signup_affiliate(
     cleaned_phone = (phone or "").strip() or None
     cleaned_why = (why_join or "").strip() or None
 
+    # An invite code is optional, but one that was given must be real: a
+    # typo would otherwise silently cost the person who invited them.
+    inviter = None
+    if (referral_code or "").strip():
+        inviter = inviter_for_code(referral_code)
+        if not inviter:
+            raise ValueError(
+                "That invite code isn't valid. Check it with the person who "
+                "invited you, or leave it blank."
+            )
+
     # Create affiliate row in pending state
     affiliate = Affiliate(
         name=cleaned_name,
         email=cleaned_email,
         phone=cleaned_phone,
         status="pending",
+        # Fixed here, at sign-up, and never edited afterwards.
+        referred_by_id=inviter.id if inviter else None,
     )
     db.session.add(affiliate)
     db.session.flush()
@@ -332,9 +347,12 @@ def approve_affiliate(affiliate_or_user_id: int) -> Tuple[User, Affiliate]:
         affiliate.backend_ref = f"AFF-{affiliate.id}"
         user.affiliate_id = affiliate.id
 
+    newly_approved = affiliate.status != "approved"
     user.status = "approved"
     user.rejection_reason = None
     affiliate.status = "approved"
+    # Every member gets an invite code of their own from the start.
+    ensure_code(affiliate)
 
     # Push to store now that admin has approved them as a member
     _push_affiliate(affiliate)
@@ -347,6 +365,16 @@ def approve_affiliate(affiliate_or_user_id: int) -> Tuple[User, Affiliate]:
         "You can now create links and start earning.",
         "/links",
     )
+    # Told once, when their recruit actually becomes a member — not at
+    # sign-up, because an application that is turned down joins nobody.
+    if newly_approved and affiliate.referred_by_id:
+        notify_affiliate(
+            affiliate.referred_by_id, "referral.joined",
+            f"{first_name(affiliate.name)} joined with your invite",
+            f"You earn {Config.REFERRAL_BONUS_PERCENT:g}% of every completed order "
+            f"{first_name(affiliate.name)} sells.",
+            "/invite",
+        )
     return user, affiliate
 
 
